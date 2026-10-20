@@ -1,0 +1,126 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 阶段一：云端实验验证（本地没有合适机器时，用 GitHub runner 先跑一遍）
+#
+# 【放置位置】放到你 fork 的仓库里：
+#   .github/workflows/experiment.yml                    ← 本文件
+#   tools/offline-kit/experiment.sh                     ← 本工具包的 experiment.sh
+#   tools/offline-kit/build-offline.sh                  ← 本工具包的 build-offline.sh（阶段二用）
+#
+# 【干什么】在 amd64 / arm64 runner 上装 dsh → 起 Web UI → 健康检查，
+#           确认「这个版本能用」，再决定打离线包。
+#
+# 【注意】GitHub 的 arm64 runner（ubuntu-24.04-arm）**只对 Public 仓库免费**，
+#         私有仓库会消耗付费额度。
+# ═══════════════════════════════════════════════════════════════════════════
+name: Experiment dsh (amd64 + arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'dsh 版本'
+        required: false
+        default: '0.2.1-rc.2'
+      arch:
+        description: '跑哪些架构'
+        required: false
+        default: 'both'
+        type: choice
+        options: [both, amd64, arm64]
+      from_source:
+        description: '从源码构建（慢，10~30 分钟）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    # 不能用 job 级 if 引用 matrix（matrix 在 job 展开前求值），所以用动态 matrix 过滤
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON((github.event.inputs.arch || 'both') == 'both' && '{"include":[{"arch":"amd64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]}' || (github.event.inputs.arch || 'both') == 'amd64' && '{"include":[{"arch":"amd64","runner":"ubuntu-latest"}]}' || '{"include":[{"arch":"arm64","runner":"ubuntu-24.04-arm"}]}') }}
+    name: Experiment ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Locate kit script
+        id: kit
+        run: |
+          # 三个位置都认：tools/offline-kit/ 、offline-kit/ 、仓库根目录
+          for d in tools/offline-kit offline-kit .; do
+            if [ -f "$d/experiment.sh" ]; then
+              echo "dir=$d" >> "$GITHUB_OUTPUT"
+              echo "找到脚本：$d/experiment.sh"
+              exit 0
+            fi
+          done
+          echo "::error::找不到 experiment.sh。请上传到以下任一位置：tools/offline-kit/ 、offline-kit/ 、或仓库根目录"
+          exit 1
+
+      - name: Diagnostics
+        run: |
+          echo "arch    : $(uname -m)"
+          echo "runner  : ${{ matrix.runner }}"
+          echo "node    : $(node --version)"
+          echo "npm     : $(npm --version)"
+          echo "glibc   : $(getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version | head -1)"
+          echo "脚本目录: ${{ steps.kit.outputs.dir }}"
+
+      - name: Prepare pnpm (only for --from-source)
+        if: ${{ inputs.from_source }}
+        run: |
+          corepack enable || true
+          corepack prepare pnpm@11.28.5 --activate || npm i -g pnpm@11.28.5 || true
+          pnpm --version || true
+
+      - name: Run experiment (install + boot Web UI)
+        env:
+          DSH_VERSION: ${{ inputs.version }}
+        run: |
+          set -uo pipefail
+          FLAGS="--keep"
+          if [ "${{ inputs.from_source }}" = "true" ]; then FLAGS="$FLAGS --from-source"; fi
+          mkdir -p "$HOME/.dsh-lab"
+          bash "${{ steps.kit.outputs.dir }}/experiment.sh" --version "${DSH_VERSION}" $FLAGS \
+            2>&1 | tee "$HOME/.dsh-lab/run.log" &
+          EXP_PID=$!
+          # 等 Web UI 就绪（脚本内部也会等，这里再做一次独立健康检查）
+          READY=0
+          for i in $(seq 1 40); do
+            if curl -sf -o /dev/null "http://127.0.0.1:3080/" 2>/dev/null; then READY=1; break; fi
+            sleep 5
+          done
+          wait "$EXP_PID" || true
+          echo "READY=$READY"
+          if [ "$READY" = "1" ]; then
+            echo "::notice::Web UI 就绪 http://127.0.0.1:3080/"
+            curl -sS -o /dev/null -w "http_code=%{http_code}\n" http://127.0.0.1:3080/ || true
+          else
+            echo "::warning::端口未就绪，看日志"
+          fi
+          pkill -f "dsh.*web" 2>/dev/null || true
+          # 收集日志（artifact 路径不展开 ~，先拷到工作区）
+          mkdir -p dsh-lab-logs
+          cp -r "$HOME/.dsh-lab"/. dsh-lab-logs/ 2>/dev/null || true
+          [ "$READY" = "1" ] || { echo "::error::Web UI 未能就绪"; exit 1; }
+
+      - name: Upload experiment logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-logs-${{ matrix.arch }}
+          path: dsh-lab-logs/**
+          if-no-files-found: warn
+          retention-days: 7
