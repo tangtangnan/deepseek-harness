@@ -13,9 +13,20 @@
 # 用法：
 #   bash experiment.sh                       # 装默认版本 + 启动 Web UI 冒烟后退出
 #   bash experiment.sh --version 0.2.0-rc.2  # 指定版本
-#   bash experiment.sh --port 3081 --keep    # 冒烟后保留服务进程（手动 Ctrl-C 结束）
+#   bash experiment.sh --port 3081 --keep    # 冒烟后保留服务进程（手动 kill 结束）
 #   bash experiment.sh --from-source         # 从源码构建（慢：pnpm i + build，10~30 分钟）
 #   bash experiment.sh --prefix /data/dshlab # 指定实验目录
+#   bash experiment.sh --no-smoke            # 只装 + --version + 原生模块自检，不起服务
+#
+# 【关于 Web 冒烟的心智模型】
+#   dsh 的 Web 服务**带 token 鉴权**：启动时打印
+#     dsh web: http://127.0.0.1:3080/?token=<43 字符>
+#   不带 token 直接 GET / 会回 **401**（这是设计，不是故障）。
+#   所以判活不能用 curl -f（401 会被当成失败），本脚本改为：
+#     ① 端口有任意 HTTP 响应（含 401）即视为已监听；
+#     ② 再从日志里抓出那行 token URL，按真实访问路径探一次（预期 303）。
+#   机器判活总是隔着一层，**最终还是你自己开浏览器看一眼最准**——
+#   不想等就 --no-smoke，把验证留到真机上做。
 #
 # 环境变量：
 #   DSH_VERSION=0.2.1-rc.2   默认安装版本
@@ -196,9 +207,28 @@ else
   warn "未找到原生模块 @deepseek-ai/node-addon-system-*（文件锁/landlock 相关能力可能降级，Web UI 通常仍可启动）"
 fi
 
+# 取 HTTP 状态码：连不上/超时/无 curl 都返回 000
+http_code() {
+  local c=""
+  if command -v curl >/dev/null 2>&1; then
+    c="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$1" 2>/dev/null)" || c=""
+  elif command -v wget >/dev/null 2>&1; then
+    c="$(wget -q -S -O /dev/null -T 5 "$1" 2>&1 \
+          | grep -o 'HTTP/[0-9.]* [0-9]\{3\}' | tail -1 | awk '{print $2}')" || c=""
+  fi
+  case "$c" in
+    [1-9]*) printf '%s' "$c" ;;
+    *) printf '000' ;;
+  esac
+}
+
 # ── ④ 冒烟：启动 Web UI ───────────────────────────────────────────────────
+READY=0
+UP_CODE=000
 if [ "$NO_SMOKE" = "1" ]; then
-  say "④ 跳过冒烟（--no-smoke）"
+  say "④ 跳过 Web 冒烟（--no-smoke）"
+  info "已验证：安装 / 版本 / 原生模块。服务能否打开留到目标机上用浏览器确认"
+  echo "SMOKE=SKIP"
 else
   say "④ 冒烟：启动 dsh web（端口 $DSH_PORT）"
   LOG="$LAB/web.log"
@@ -208,25 +238,55 @@ else
   SRV_PID=$!
   trap 'kill $SRV_PID 2>/dev/null || true' EXIT
 
-  READY=0
+  # 等就绪：优先等 dsh 打印的 ready URL（含 token，打印即表示已监听），
+  # 同时兼探端口——注意 401 也算活着，那是 dsh 的 token 鉴权在正常工作。
+  TOKEN_URL=""
+  UP_CODE=000
   for i in $(seq 1 30); do
-    if curl -sf -o /dev/null "http://127.0.0.1:$DSH_PORT/" 2>/dev/null; then READY=1; break; fi
+    if [ -z "$TOKEN_URL" ]; then
+      TOKEN_URL="$(grep -o "http://127\.0\.0\.1:[0-9]\{2,5\}/?token=[A-Za-z0-9_-]\{20,\}" \
+                    "$LOG" 2>/dev/null | head -1)"
+    fi
+    [ -n "$TOKEN_URL" ] && break
+    UP_CODE="$(http_code "http://127.0.0.1:$DSH_PORT/")"
+    [ "$UP_CODE" != "000" ] && break
     kill -0 "$SRV_PID" 2>/dev/null || break
     sleep 2
   done
 
+  READY=0
+  if [ "$UP_CODE" != "000" ]; then
+    READY=1
+    ok "端口已监听（HTTP $UP_CODE；401 = 缺 token，属正常鉴权响应）"
+  fi
+  if [ -n "$TOKEN_URL" ]; then
+    info "服务自报地址：$TOKEN_URL"
+    TCODE="$(http_code "$TOKEN_URL")"
+    case "$TCODE" in
+      200|303)
+        ok "带 token 访问正常（HTTP $TCODE，已下发会话 Cookie）"
+        READY=1
+        [ "$UP_CODE" = "000" ] && UP_CODE="$TCODE"
+        ;;
+      *) warn "带 token 访问返回 HTTP $TCODE（预期 303 或 200）" ;;
+    esac
+  else
+    warn "日志里没抓到 dsh 打印的 ready URL（含 token）"
+  fi
+
   if [ "$READY" = "1" ]; then
-    ok "Web UI 已就绪：http://127.0.0.1:$DSH_PORT/"
     info "首次使用需在页面上配置 DeepSeek API Key（这是产品逻辑，与离线包无关）"
   else
-    warn "端口未能在 60s 内响应。日志尾部："
+    warn "Web 服务未能在预期时间内就绪。日志尾部："
     tail -25 "$LOG" 2>/dev/null | sed 's/^/    /'
-    warn "可能原因：① 启动更慢（再等等，或用 --keep 后台跑）② 端口被占（换 --port）③ 启动报错（看上面日志）"
+    warn "可能原因：① 启动更慢（加 --keep 后台跑，自己盯日志）② 端口被占（换 --port）③ 启动报错（看上面日志）"
   fi
+  echo "SMOKE=$READY"
 
   if [ "$KEEP" = "1" ]; then
     trap - EXIT
     ok "已按 --keep 保留服务进程（PID $SRV_PID），日志：$LOG"
+    [ -n "$TOKEN_URL" ] && info "浏览器打开：$TOKEN_URL"
     info "结束服务：kill $SRV_PID"
     exit 0
   fi
@@ -234,14 +294,22 @@ fi
 
 # ── ⑤ 结论 ────────────────────────────────────────────────────────────────
 say "⑤ 实验结论"
+if [ "$NO_SMOKE" = "1" ]; then
+  SMOKE_TXT="未做（--no-smoke）：服务能否打开留到目标机验证"
+elif [ "$READY" = "1" ]; then
+  SMOKE_TXT="服务已起（HTTP $UP_CODE）"
+else
+  SMOKE_TXT="未在预期时间内就绪 —— 不代表装错了，也可能是启动慢"
+fi
 cat <<TIP
 
   版本      : $VERSION_OUT
   安装方式  : $([ "$FROM_SOURCE" = "1" ] && echo '源码构建' || echo "npm 包 @deepseek-ai/dsh@$DSH_VERSION")
   实验目录  : $LAB
   Node      : $(node --version)  ($NODE_DIR)
+  Web 冒烟  : $SMOKE_TXT
 
-  如果这一步 Web UI 能打开、能正常对话，就可以进入阶段二：
+  装得上、原生模块对，就可以进入阶段二：
   在**与目标机同架构**的联网机器上执行 build-offline.sh 打离线包，
   再把 tar.gz 拷到断网机器安装。
 
