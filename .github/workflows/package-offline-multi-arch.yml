@@ -1,0 +1,182 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 阶段二：一次构建 amd64 + arm64 两个全离线便携包
+#
+# 【放置位置】放到你 fork 的仓库里：
+#   .github/workflows/package-offline-multi-arch.yml   ← 本文件
+#   tools/offline-kit/build-offline.sh                 ← 本工具包的构建脚本
+#
+# 【产物】Artifacts：
+#   offline-amd64 / offline-arm64       单架构包
+#   offline-all-arch                    两包 + sha256 + MANIFEST（推荐下这个）
+#
+# 【注意】
+#   · arm64 runner（ubuntu-24.04-arm）仅对 Public 仓库免费；
+#   · 两包合计约 700MB~1GB，Artifact 只保留 90 天（inputs.retention 可调），
+#     建议勾 publish_release 生成 Draft Release 长期保存；
+#   · 插件预装（默认开）会让包大 ~300MB，想瘦身把 inputs.slim 设为 true。
+# ═══════════════════════════════════════════════════════════════════════════
+name: Package dsh offline (amd64 + arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'dsh 版本'
+        required: false
+        default: '0.2.1-rc.2'
+      arch:
+        description: '构建哪些架构'
+        required: false
+        default: 'both'
+        type: choice
+        options: [both, amd64, arm64]
+      slim:
+        description: '跳过 profile 插件预装（包更小，离线机启动会尝试拉插件后跳过）'
+        required: false
+        default: false
+        type: boolean
+      retention:
+        description: 'Artifact 保留天数'
+        required: false
+        default: '30'
+      publish_release:
+        description: '生成 Draft Release（长期保存 + 分享链接）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON((github.event.inputs.arch || 'both') == 'both' && '{"include":[{"arch":"amd64","runner":"ubuntu-latest","elf":"x86-64"},{"arch":"arm64","runner":"ubuntu-24.04-arm","elf":"ARM aarch64"}]}' || (github.event.inputs.arch || 'both') == 'amd64' && '{"include":[{"arch":"amd64","runner":"ubuntu-latest","elf":"x86-64"}]}' || '{"include":[{"arch":"arm64","runner":"ubuntu-24.04-arm","elf":"ARM aarch64"}]}') }}
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare pnpm (profile plugin seeding)
+        run: |
+          corepack enable || true
+          corepack prepare pnpm@11.28.5 --activate || npm i -g pnpm@11.28.5 || echo "pnpm 不可用，将回退为 --slim 行为"
+          pnpm --version || true
+
+      - name: Locate kit script
+        id: kit
+        run: |
+          # 三个位置都认：tools/offline-kit/ 、offline-kit/ 、仓库根目录
+          for d in tools/offline-kit offline-kit .; do
+            if [ -f "$d/build-offline.sh" ]; then
+              echo "dir=$d" >> "$GITHUB_OUTPUT"
+              echo "找到脚本：$d/build-offline.sh"
+              exit 0
+            fi
+          done
+          echo "::error::找不到 build-offline.sh。请上传到以下任一位置：tools/offline-kit/ 、offline-kit/ 、或仓库根目录"
+          exit 1
+
+      - name: Diagnostics
+        run: |
+          echo "arch  : $(uname -m)"
+          echo "node  : $(node --version)  npm: $(npm --version)"
+          echo "脚本目录: ${{ steps.kit.outputs.dir }}"
+          df -h "$HOME" | tail -1
+
+      - name: Build offline package
+        env:
+          DSH_VERSION: ${{ inputs.version }}
+        run: |
+          set -uo pipefail
+          FLAGS="--arch ${{ matrix.arch }}"
+          [ "${{ inputs.slim }}" = "true" ] && FLAGS="$FLAGS --slim"
+          bash "${{ steps.kit.outputs.dir }}/build-offline.sh" --version "${DSH_VERSION}" $FLAGS
+
+      - name: Verify artifact
+        run: |
+          set -uo pipefail
+          TARBALL="$(ls release/deepseek-harness-*-offline-${{ matrix.arch }}.tar.gz | head -1)"
+          echo "产物: $TARBALL  $(du -h "$TARBALL" | cut -f1)"
+          TMP="$(mktemp -d)"
+          tar -xzf "$TARBALL" -C "$TMP"
+          DIR="$(ls -d "$TMP"/deepseek-harness-*-offline-${{ matrix.arch }} | head -1)"
+          echo "① ELF 架构校验（应为 ${{ matrix.elf }}）"
+          file "$DIR/runtime/bin/node" | tee /tmp/elf.txt
+          grep -q "${{ matrix.elf }}" /tmp/elf.txt || { echo "::error::Node ELF 架构不符"; exit 1; }
+          echo "② 关键文件"
+          for f in runtime/bin/node kernel/node_modules/@deepseek-ai/dsh/lib/bin.js install.sh uninstall.sh 说明.md; do
+            [ -e "$DIR/$f" ] && echo "  OK $f" || { echo "::error::缺少 $f"; exit 1; }
+          done
+          echo "③ 原生模块"
+          ls -d "$DIR"/kernel/node_modules/@deepseek-ai/node-addon-system-* 2>/dev/null || echo "  ⚠ 未找到 node-addon-system-*（降级）"
+          ls "$DIR"/kernel/node_modules/node-pty/build/Release/pty.node 2>/dev/null \
+            || ls -d "$DIR"/kernel/node_modules/node-pty/prebuilds/*/ 2>/dev/null \
+            || echo "  ⚠ node-pty 未产出二进制（终端功能可能不可用）"
+          echo "④ 依赖规模"
+          echo "  @deepseek-ai/* : $(ls -1 "$DIR/kernel/node_modules/@deepseek-ai" | wc -l) 个"
+          du -sh "$DIR"
+
+      - name: Upload per-arch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-${{ matrix.arch }}
+          path: release/deepseek-harness-*-offline-${{ matrix.arch }}*
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(inputs.retention) }}
+
+  publish:
+    name: Collect all architectures
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all
+          pattern: offline-*
+          merge-multiple: true
+
+      - name: Summarize
+        run: |
+          cd all
+          ls -lh
+          echo "=== MANIFEST 汇总 ==="
+          cat *.MANIFEST.txt 2>/dev/null || true
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-all-arch
+          path: all/*
+          retention-days: ${{ fromJSON(inputs.retention) }}
+
+      - name: Create draft release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: offline-${{ inputs.version }}-${{ github.run_number }}
+          name: DeepSeek Harness offline ${{ inputs.version }}
+          body: |
+            全离线便携包（免 root / 免网络 / 免包管理器）
+
+            ```
+            tar -xzf deepseek-harness-<version>-offline-<arch>.tar.gz
+            cd deepseek-harness-<version>-offline-<arch>
+            bash install.sh
+            dsh web --no-open        # http://127.0.0.1:3080
+            ```
+
+            校验：同目录 `.sha256` 文件。
+          files: all/*
