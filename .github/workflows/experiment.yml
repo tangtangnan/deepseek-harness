@@ -6,8 +6,17 @@
 #   tools/offline-kit/experiment.sh                     ← 本工具包的 experiment.sh
 #   tools/offline-kit/build-offline.sh                  ← 本工具包的 build-offline.sh（阶段二用）
 #
-# 【干什么】在 amd64 / arm64 runner 上装 dsh → 起 Web UI → 健康检查，
-#           确认「这个版本能用」，再决定打离线包。
+# 【干什么】在 amd64 / arm64 runner 上装 dsh，确认「这个版本能装上、原生模块对」。
+#
+# 【smoke 开关】默认 skip —— 只装不启服务，最快，也不卡失败。
+#   skip    : 不起 Web 服务（推荐：Web 能不能打开，最终你在真机上用浏览器确认最准）
+#   warn    : 起一次 Web 服务做判活，不通过也只是警告
+#   require : 起服务且判活不通过就直接判 job 失败
+#
+# 【为什么默认不验证 Web】dsh 的 Web 服务带 token 鉴权：
+#   启动时打印 `dsh web: http://127.0.0.1:3080/?token=<...>`，
+#   不带 token 直接 GET / 会回 401。用 curl -f 探会把 401 误判成「没起来」。
+#   所以云端判活参考价值有限，真机开一眼才是终局。
 #
 # 【注意】GitHub 的 arm64 runner（ubuntu-24.04-arm）**只对 Public 仓库免费**，
 #         私有仓库会消耗付费额度。
@@ -32,6 +41,12 @@ on:
         required: false
         default: false
         type: boolean
+      smoke:
+        description: 'Web 冒烟：skip=不起服务(最快) / warn=起服务但不卡失败 / require=必须起来否则判失败'
+        required: false
+        default: 'skip'
+        type: choice
+        options: [skip, warn, require]
 
 permissions:
   contents: read
@@ -85,36 +100,38 @@ jobs:
           corepack prepare pnpm@11.28.5 --activate || npm i -g pnpm@11.28.5 || true
           pnpm --version || true
 
-      - name: Run experiment (install + boot Web UI)
+      - name: Run experiment (install dsh)
+        id: exp
         env:
           DSH_VERSION: ${{ inputs.version }}
         run: |
           set -uo pipefail
-          FLAGS="--keep"
+          FLAGS=""
           if [ "${{ inputs.from_source }}" = "true" ]; then FLAGS="$FLAGS --from-source"; fi
+          if [ "${{ inputs.smoke }}" = "skip" ]; then FLAGS="$FLAGS --no-smoke"; fi
           mkdir -p "$HOME/.dsh-lab"
           bash "${{ steps.kit.outputs.dir }}/experiment.sh" --version "${DSH_VERSION}" $FLAGS \
-            2>&1 | tee "$HOME/.dsh-lab/run.log" &
-          EXP_PID=$!
-          # 等 Web UI 就绪（脚本内部也会等，这里再做一次独立健康检查）
-          READY=0
-          for i in $(seq 1 40); do
-            if curl -sf -o /dev/null "http://127.0.0.1:3080/" 2>/dev/null; then READY=1; break; fi
-            sleep 5
-          done
-          wait "$EXP_PID" || true
-          echo "READY=$READY"
-          if [ "$READY" = "1" ]; then
-            echo "::notice::Web UI 就绪 http://127.0.0.1:3080/"
-            curl -sS -o /dev/null -w "http_code=%{http_code}\n" http://127.0.0.1:3080/ || true
-          else
-            echo "::warning::端口未就绪，看日志"
-          fi
-          pkill -f "dsh.*web" 2>/dev/null || true
-          # 收集日志（artifact 路径不展开 ~，先拷到工作区）
+            2>&1 | tee "$HOME/.dsh-lab/run.log"
+          # 脚本会打印 SMOKE=1 / SMOKE=0 / SMOKE=SKIP 供下一步判定
+          SMOKE="$(grep -o '^SMOKE=[A-Za-z0-9]*' "$HOME/.dsh-lab/run.log" | tail -1 | cut -d= -f2)"
+          echo "smoke=${SMOKE:-SKIP}" >> "$GITHUB_OUTPUT"
+          echo "smoke_result=${SMOKE:-SKIP}"
+
+      - name: Gate on Web readiness (only when smoke=require)
+        # 默认 skip/warn 都不卡失败：Web 能不能打开，最终由你在真机上用浏览器确认
+        if: ${{ inputs.smoke == 'require' && steps.exp.outputs.smoke != '1' }}
+        run: |
+          echo "::error::Web UI 未能就绪（smoke=require）。看 experiment-logs 里的 web.log"
+          exit 1
+
+      - name: Collect logs
+        if: always()
+        run: |
+          # artifact 路径不展开 ~，先把日志拷到工作区
+          # （不需要 pkill：脚本自己会用 trap 收掉起的服务）
           mkdir -p dsh-lab-logs
           cp -r "$HOME/.dsh-lab"/. dsh-lab-logs/ 2>/dev/null || true
-          [ "$READY" = "1" ] || { echo "::error::Web UI 未能就绪"; exit 1; }
+          true
 
       - name: Upload experiment logs
         if: always()
