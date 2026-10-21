@@ -96,11 +96,21 @@ jobs:
       - name: Build offline package
         env:
           DSH_VERSION: ${{ inputs.version }}
+          # build-offline.sh 默认把产物写到「脚本所在目录」的 release/
+          # （tools/offline-kit/release），而后续 Verify/Upload 都在仓库根找 release/。
+          # 显式指定 OUT 让产物落到仓库根，两边的路径约定就一致了。
+          OUT: release
         run: |
           set -uo pipefail
           FLAGS="--arch ${{ matrix.arch }}"
           [ "${{ inputs.slim }}" = "true" ] && FLAGS="$FLAGS --slim"
           bash "${{ steps.kit.outputs.dir }}/build-offline.sh" --version "${DSH_VERSION}" $FLAGS
+
+      - name: Confirm tarball location
+        run: |
+          echo "仓库根 release/："; ls -lh release/ 2>/dev/null || echo "  （空）"
+          echo "脚本目录 release/（应为空或不存在）："
+          ls -lh "${{ steps.kit.outputs.dir }}/release/" 2>/dev/null || echo "  （不存在，正确）"
 
       - name: Verify artifact
         run: |
