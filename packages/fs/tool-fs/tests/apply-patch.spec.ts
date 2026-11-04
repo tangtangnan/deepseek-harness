@@ -11,7 +11,7 @@ import type { PtcRunRequest, PtcRunSpec } from '@deepseek-ai/dsh-ptc-runtime'
 import { add, move, patch, remove, setup, update } from './patch/harness.ts'
 
 const guidance = 'Prefer apply_patch over separate edit calls for changes across files or separated regions. '
-  + 'Read a file before updating, deleting, or moving it (the default fs-observation-policy requires it), unless you just created or edited it in this session. '
+  + 'Give every hunk enough surrounding context lines to match one place in the current file. '
   + 'The whole patch is checked first (syntax, hunk matching, missing files) and a rejected patch changes nothing; once applying starts, operations run in order, stop at the first failure, and are not rolled back, so re-read affected files before retrying when needed.'
 
 type Fixture = Awaited<ReturnType<typeof setup>>
@@ -27,7 +27,7 @@ it('omits patch registration and guidance when disabled', async () => {
 
 it('registers patch guidance when enabled and removes tool and section on disposal', async () => {
   const t = await setup()
-  expect(t.ctx.tools.get('apply_patch')?.description).toBe('Create, update, delete, or move UTF-8 text files with one Codex-style patch; '
+  expect(t.ctx.tools.get('apply_patch')?.description).toBe('Create, update, delete, or move UTF-8 text files with one patch; '
     + 'prefer it over multiple edit calls when a change spans several files or separated regions.')
   const key = {}
   let scope!: Scope

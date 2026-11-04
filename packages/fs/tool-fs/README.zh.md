@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-使用 `dsh-tool-fs` 可让模型带行号读取 UTF-8 文件、读取受支持的图片、创建或原子地替换文件，执行有针对性的字面量编辑，以及应用 Codex 风格的多文件补丁。结果都有上限，失败会提供稳定错误码与恢复指令。当写入和编辑必须在成功读取后执行时，请添加 `dsh-fs-observation-policy`；省略它时，变更仍是原子的，但不受此条件约束。图片读取需要持久附件存储和支持图片输入的路由模型。glob 或 grep 搜索请选择同级的发现工具包。
+使用 `dsh-tool-fs` 可让模型带行号读取 UTF-8 文件、读取受支持的图片、创建或原子地替换文件，执行有针对性的字面量编辑，以及应用多文件补丁。结果都有上限，失败会提供稳定错误码与恢复指令。当写入和编辑必须在成功读取后执行时，请添加 `dsh-fs-observation-policy`；省略它时，变更仍是原子的，但不受此条件约束。图片读取需要持久附件存储和支持图片输入的路由模型。glob 或 grep 搜索请选择同级的发现工具包。
 
 ## 目录
 
@@ -39,7 +39,7 @@ kind: "package-reference"
 - name: '@deepseek-ai/dsh-tool-fs'
 ```
 
-策略插件是可选的：省略时，工具直接使用裸提供方（无条件写入、覆盖、编辑与补丁，无已观察状态）。加载这些工具的部署也应加载该插件，从而提供写入/编辑/补丁前读取行为。`read_image` 只在持久 `ctx.attachments` 服务已挂载时注册；执行时还拒绝确切模型未声明图像输入的路由，因此文本路由的持久历史不会出现图像块。
+策略插件是可选的：省略时，工具直接使用裸提供方（无条件写入、覆盖、编辑与补丁，无已观察状态），随发行版交付的组合就是这样运行的——[`dsh-base`](../../bundle/base/cordis.patch.yml) 中的 `fs-observation-policy` 行写着 `disabled: true`；改为 `false` 即对所有修改工具要求先读并拒绝过期版本。`read_image` 只在持久 `ctx.attachments` 服务已挂载时注册；执行时还拒绝确切模型未声明图像输入的路由，因此文本路由的持久历史不会出现图像块。
 
 ### 工具
 
@@ -55,7 +55,7 @@ kind: "package-reference"
 
 ### 配置
 
-所有键均为可选。`read`、`readImage`、`write` 和 `edit` 开关默认为 `true`；将开关设为 `false` 可省略对应工具及其指导文本。`applyPatch` 默认为 `false`，因此默认组合不注册 `apply_patch`；启用 `edit` 的随发行版交付的 `tool-fs` 行（[`dsh-base`](../../bundle/base/cordis.patch.yml) 以及 Web 的 `standard`、`ptc`、`cordis` preset）显式写出 `applyPatch: false`，把这一行改为 `true` 即在 `edit` 旁加入该工具。允许关闭全部五个工具。启用 `readImage` 仍需要附件存储和支持图片输入的模型。关闭 `read` 时仍会校验读取上限。
+所有键均为可选。`read`、`readImage`、`write` 和 `edit` 开关默认为 `true`；将开关设为 `false` 可省略对应工具及其指导文本。`applyPatch` 默认为 `false`；[`dsh-base`](../../bundle/base/cordis.patch.yml) 与 Web 的 `standard` preset 在各自的 `tool-fs` 行上开启它，而 Web 的 `ptc`、`cordis` preset 显式写出 `applyPatch: false`，改这一行即可在 `edit` 旁加入或去掉该工具。允许关闭全部五个工具。启用 `readImage` 仍需要附件存储和支持图片输入的模型。关闭 `read` 时仍会校验读取上限。
 
 | 键 | 默认值 | 含义 |
 |---|---|---|
@@ -163,19 +163,19 @@ kind: "package-reference"
 ##### Read 指导
 
 ```markdown
-Use the read tool — not shell commands like cat — to inspect text files. Use offset and limit to continue reading large files.
+Use the read tool — not shell commands like cat, sed, head, or tail — to inspect text files. Use offset and limit to read a line range or continue a large file.
 ```
 
 ##### Write 指导
 
 ```markdown
-Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.
+Read an existing file before overwriting it with write and prefer edit for targeted changes.
 ```
 
 ##### Edit 指导
 
 ```markdown
-Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Read a file before editing it unless you just created or edited it in this session.
 ```
 
 #### Token 影响
@@ -260,12 +260,12 @@ Read a file before editing it (the default fs-observation-policy requires it), u
 
 #### 模型看到的内容
 
-`apply_patch` schema 要求一个 `input` 字符串（沿用 Codex 的参数名，在该工具上训练过的模型会不经提示地发送这个键），包含 `*** Begin Patch` / `*** End Patch`、Add/Update/Delete 文件头、可选 Move to，以及上下文/新增/删除 hunk 行。路径相对于 Session 工作目录。有围栏后端追加与 write/edit 相同的提权字段。成功行按 A/M/D 分组，完成的移动显示 `M <destination>`，与 Codex rust-v0.158.0 一致。空补丁显示 `Success. No operations in patch.`。停止的补丁只包含适用的 Completed、Failed、Outcome unknown 与 Not executed 小节；结果不确定时以重读建议结束。语法错误保留解析器消息。
+`apply_patch` schema 要求一个 `input` 字符串，包含 `*** Begin Patch` / `*** End Patch`、Add/Update/Delete 文件头、可选 Move to，以及上下文/新增/删除 hunk 行。路径相对于 Session 工作目录。有围栏后端追加与 write/edit 相同的提权字段。成功行按 A/M/D 分组，完成的移动显示 `M <destination>`，与 Codex rust-v0.158.0 一致。空补丁显示 `Success. No operations in patch.`。停止的补丁只包含适用的 Completed、Failed、Outcome unknown 与 Not executed 小节；结果不确定时以重读建议结束。语法错误保留解析器消息。
 
 ##### 系统提示
 
 ```markdown
-Prefer apply_patch over separate edit calls for changes across files or separated regions. Read a file before updating, deleting, or moving it (the default fs-observation-policy requires it), unless you just created or edited it in this session. The whole patch is checked first (syntax, hunk matching, missing files) and a rejected patch changes nothing; once applying starts, operations run in order, stop at the first failure, and are not rolled back, so re-read affected files before retrying when needed.
+Prefer apply_patch over separate edit calls for changes across files or separated regions. Give every hunk enough surrounding context lines to match one place in the current file. The whole patch is checked first (syntax, hunk matching, missing files) and a rejected patch changes nothing; once applying starts, operations run in order, stop at the first failure, and are not rolled back, so re-read affected files before retrying when needed.
 ```
 
 ##### 结果示例
@@ -286,7 +286,7 @@ Not executed:
 - operation 3 (add src/d.ts)
 
 Patch rejected before any change (1 problems):
-- operation 1 (update src/a.ts, patch line 2): cannot modify "src/a.ts": file has not been read — read the file, then retry
+- operation 1 (update src/a.ts, patch line 2): cannot patch "src/a.ts": hunk at patch line 3 (oldLines) does not match — const old = 1
 ```
 
 #### Token 影响

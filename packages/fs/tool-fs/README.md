@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Use `dsh-tool-fs` to let a model read UTF-8 files with line numbers, read supported images, create or atomically replace files, apply targeted literal edits, and apply Codex-style multi-file patches. Results are capped, and failures provide stable error codes and recovery instructions. Add `dsh-fs-observation-policy` when writes and edits must follow a successful read; without it, mutations remain atomic but are unconditional. Image reads require durable attachment storage and an image-capable routed model. Choose the sibling discovery package for glob or grep searches.
+Use `dsh-tool-fs` to let a model read UTF-8 files with line numbers, read supported images, create or atomically replace files, apply targeted literal edits, and apply multi-file patches. Results are capped, and failures provide stable error codes and recovery instructions. Add `dsh-fs-observation-policy` when writes and edits must follow a successful read; without it, mutations remain atomic but are unconditional. Image reads require durable attachment storage and an image-capable routed model. Choose the sibling discovery package for glob or grep searches.
 
 ## Table of Contents
 
@@ -39,7 +39,7 @@ A backend, the policy plugin, then the tools; the attachment store is optional a
 - name: '@deepseek-ai/dsh-tool-fs'
 ```
 
-The policy plugin is optional: without it the tools run against the bare provider (unconditional write, overwrite, edit, and patch with no observed state). A deployment that loads these tools is expected to also load it, so the behavior is read-before-write/edit/patch. `read_image` registers only while a durable `ctx.attachments` service is mounted; execution additionally refuses on a route whose exact model does not declare image input, so a text route's durable history stays free of image blocks.
+The policy plugin is optional: without it the tools run against the bare provider (unconditional write, overwrite, edit, and patch with no observed state), which is how the shipped compositions run — [`dsh-base`](../../bundle/base/cordis.patch.yml) lists the `fs-observation-policy` row `disabled: true`; set it to `false` to require prior reads and reject stale versions for every mutating tool. `read_image` registers only while a durable `ctx.attachments` service is mounted; execution additionally refuses on a route whose exact model does not declare image input, so a text route's durable history stays free of image blocks.
 
 ### The tools
 
@@ -55,7 +55,7 @@ Field names are snake_case to match Claude Code and existing harness tool schema
 
 ### Configuration
 
-All keys are optional. The `read`, `readImage`, `write`, and `edit` switches default to `true`; set a switch to `false` to omit that tool and its guidance. `applyPatch` defaults to `false`, so the default composition registers no `apply_patch`; the shipped `tool-fs` rows that enable `edit` ([`dsh-base`](../../bundle/base/cordis.patch.yml) and the Web `standard`, `ptc`, and `cordis` presets) state `applyPatch: false`, and changing that one line to `true` adds the tool beside `edit`. All five tools may be disabled. Enabling `readImage` still requires an attachment store and an image-capable model. Read caps remain validated when `read` is disabled.
+All keys are optional. The `read`, `readImage`, `write`, and `edit` switches default to `true`; set a switch to `false` to omit that tool and its guidance. `applyPatch` defaults to `false`; [`dsh-base`](../../bundle/base/cordis.patch.yml) and the Web `standard` preset enable it on their `tool-fs` rows, while the Web `ptc` and `cordis` presets state `applyPatch: false`, and changing that one line adds or drops the tool beside `edit`. All five tools may be disabled. Enabling `readImage` still requires an attachment store and an image-capable model. Read caps remain validated when `read` is disabled.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -163,19 +163,19 @@ At assembly time, each guidance section checks `ctx.tools.get(name, scope)` and 
 ##### Read guidance
 
 ```markdown
-Use the read tool — not shell commands like cat — to inspect text files. Use offset and limit to continue reading large files.
+Use the read tool — not shell commands like cat, sed, head, or tail — to inspect text files. Use offset and limit to read a line range or continue a large file.
 ```
 
 ##### Write guidance
 
 ```markdown
-Read an existing file before overwriting it with write (the default fs-observation-policy requires it) and prefer edit for targeted changes.
+Read an existing file before overwriting it with write and prefer edit for targeted changes.
 ```
 
 ##### Edit guidance
 
 ```markdown
-Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Read a file before editing it unless you just created or edited it in this session.
 ```
 
 #### Token effect
@@ -260,12 +260,12 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 #### What the model sees
 
-The `apply_patch` schema requires one `input` string (the Codex parameter name, which models trained on that tool send unprompted) containing `*** Begin Patch` / `*** End Patch`, Add/Update/Delete headers, optional Move to, and context/add/remove hunk lines. Paths are Session-relative. A confining backend adds the same escalation fields as write/edit. Success lines group A/M/D and a completed move reports `M <destination>`, matching Codex rust-v0.158.0. An empty patch renders `Success. No operations in patch.`. A stopped patch includes only the applicable Completed, Failed, Outcome unknown and Not executed sections; unknown outcomes end with the re-read remedy. Syntax errors keep the parser message.
+The `apply_patch` schema requires one `input` string containing `*** Begin Patch` / `*** End Patch`, Add/Update/Delete headers, optional Move to, and context/add/remove hunk lines. Paths are Session-relative. A confining backend adds the same escalation fields as write/edit. Success lines group A/M/D and a completed move reports `M <destination>`, matching Codex rust-v0.158.0. An empty patch renders `Success. No operations in patch.`. A stopped patch includes only the applicable Completed, Failed, Outcome unknown and Not executed sections; unknown outcomes end with the re-read remedy. Syntax errors keep the parser message.
 
 ##### System guidance
 
 ```markdown
-Prefer apply_patch over separate edit calls for changes across files or separated regions. Read a file before updating, deleting, or moving it (the default fs-observation-policy requires it), unless you just created or edited it in this session. The whole patch is checked first (syntax, hunk matching, missing files) and a rejected patch changes nothing; once applying starts, operations run in order, stop at the first failure, and are not rolled back, so re-read affected files before retrying when needed.
+Prefer apply_patch over separate edit calls for changes across files or separated regions. Give every hunk enough surrounding context lines to match one place in the current file. The whole patch is checked first (syntax, hunk matching, missing files) and a rejected patch changes nothing; once applying starts, operations run in order, stop at the first failure, and are not rolled back, so re-read affected files before retrying when needed.
 ```
 
 ##### Result examples
@@ -286,7 +286,7 @@ Not executed:
 - operation 3 (add src/d.ts)
 
 Patch rejected before any change (1 problems):
-- operation 1 (update src/a.ts, patch line 2): cannot modify "src/a.ts": file has not been read — read the file, then retry
+- operation 1 (update src/a.ts, patch line 2): cannot patch "src/a.ts": hunk at patch line 3 (oldLines) does not match — const old = 1
 ```
 
 #### Token effect

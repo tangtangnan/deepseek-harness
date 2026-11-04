@@ -304,38 +304,33 @@
     },
     {
       "doc": "docs/subsystems/agent-team.md",
-      "symbol": "TeamMemberProjection",
-      "source": "packages/experimental/agent-team/src/types.ts"
-    },
-    {
-      "doc": "docs/subsystems/agent-team.md",
       "symbol": "TeamTaskView",
-      "source": "packages/experimental/agent-team/src/types.ts"
+      "source": "packages/team/agent-team/src/types.ts"
     },
     {
       "doc": "docs/subsystems/agent-team.md",
       "symbol": "TeamProjection",
-      "source": "packages/experimental/agent-team/src/types.ts"
+      "source": "packages/team/agent-team/src/types.ts"
     },
     {
       "doc": "docs/subsystems/agent-team.md",
       "symbol": "TeamMemberSnapshot",
-      "source": "packages/experimental/agent-team/src/types.ts"
+      "source": "packages/team/agent-team/src/types.ts"
     },
     {
       "doc": "docs/subsystems/agent-team.md",
       "symbol": "TeamMessageSnapshot",
-      "source": "packages/experimental/agent-team/src/types.ts"
+      "source": "packages/team/agent-team/src/types.ts"
     },
     {
       "doc": "docs/subsystems/agent-team.md",
       "symbol": "TeamMessageSource",
-      "source": "packages/experimental/agent-team/src/types.ts"
+      "source": "packages/team/agent-team/src/types.ts"
     },
     {
       "doc": "docs/subsystems/agent-team.md",
       "symbol": "TeamTaskSnapshot",
-      "source": "packages/experimental/agent-team/src/types.ts"
+      "source": "packages/team/agent-team/src/types.ts"
     },
     {
       "doc": "docs/subsystems/commands.md",
@@ -2137,6 +2132,11 @@
       "source": "packages/session/session-projection/src/index.ts"
     },
     {
+      "doc": "docs/subsystems/session-projection.md",
+      "symbol": "ProjectionEventChangeListener",
+      "source": "packages/session/session-projection/src/index.ts"
+    },
+    {
       "doc": "docs/subsystems/core.md",
       "symbol": "AgentHandle",
       "source": "packages/core/agent/src/index.ts"
@@ -2380,6 +2380,11 @@
     {
       "doc": "docs/subsystems/subagent.md",
       "symbol": "SubagentActivation",
+      "source": "packages/subagent/subagent/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/subagent.md",
+      "symbol": "SubagentMemberNames",
       "source": "packages/subagent/subagent/src/types.ts"
     },
     {
@@ -2695,6 +2700,21 @@
     {
       "doc": "docs/subsystems/forge.md",
       "symbol": "ForgeBranches",
+      "source": "packages/experimental/client-ui-forge/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/forge.md",
+      "symbol": "ForgeBaseBranch",
+      "source": "packages/experimental/client-ui-forge/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/forge.md",
+      "symbol": "ForgeAutomaticBase",
+      "source": "packages/experimental/client-ui-forge/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/forge.md",
+      "symbol": "ForgeBaseBranches",
       "source": "packages/experimental/client-ui-forge/src/types.ts"
     },
     {
