@@ -11,8 +11,9 @@
 #     npm 会自动按当前平台挑一个。）
 #
 # 用法：
-#   bash experiment.sh                       # 装默认版本 + 启动 Web UI 冒烟后退出
-#   bash experiment.sh --version 0.2.0-rc.2  # 指定版本
+#   bash experiment.sh                       # 装 npm 最新版 + 启动 Web UI 冒烟后退出
+#   bash experiment.sh --version 0.2.1-rc.2  # 手动锁定版本（不再自动更新）
+#   bash experiment.sh --dist-tag next       # 自动取 next 标签（默认 latest）
 #   bash experiment.sh --port 3081 --keep    # 冒烟后保留服务进程（手动 kill 结束）
 #   bash experiment.sh --from-source         # 从源码构建（慢：pnpm i + build，10~30 分钟）
 #   bash experiment.sh --prefix /data/dshlab # 指定实验目录
@@ -29,17 +30,19 @@
 #   不想等就 --no-smoke，把验证留到真机上做。
 #
 # 环境变量：
-#   DSH_VERSION=0.2.1-rc.2   默认安装版本
+#   DSH_VERSION=auto|latest|next|0.2.2-rc.1   默认 auto（构建时查 npm dist-tags）
+#   DSH_DIST_TAG=latest|next|alpha             auto 时读取哪个 dist-tag
 #   NPM_REGISTRY=...         默认 https://registry.npmmirror.com（失败自动回退 npmjs）
-#   NODE_TOOLCHAIN_VER=v22.22.0   系统没 Node 时自动下载的独立 Node 版本
+#   NODE_TOOLCHAIN_VER=v24.22.2   系统 Node 太旧时自动下载的独立版本（>=24.9.0）
 #   DSH_PORT=3080            冒烟用端口
 # ═══════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-DSH_VERSION="${DSH_VERSION:-0.2.1-rc.2}"
+DSH_VERSION="${DSH_VERSION:-auto}"
+DSH_DIST_TAG="${DSH_DIST_TAG:-latest}"
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
 NPM_REGISTRY_FALLBACK="${NPM_REGISTRY_FALLBACK:-https://registry.npmjs.org}"
-NODE_TOOLCHAIN_VER="${NODE_TOOLCHAIN_VER:-v22.22.0}"
+NODE_TOOLCHAIN_VER="${NODE_TOOLCHAIN_VER:-v24.22.2}"
 DSH_PORT="${DSH_PORT:-3080}"
 
 LAB="${LAB:-$HOME/.dsh-lab}"
@@ -52,13 +55,14 @@ SRC_REF="${SRC_REF:-master}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)      DSH_VERSION="$2"; shift 2 ;;
+    --dist-tag)     DSH_DIST_TAG="$2"; shift 2 ;;
     --port)         DSH_PORT="$2"; shift 2 ;;
     --prefix)       LAB="$2"; shift 2 ;;
     --registry)     NPM_REGISTRY="$2"; shift 2 ;;
     --from-source)  FROM_SOURCE=1; shift ;;
     --keep)         KEEP=1; shift ;;
     --no-smoke)     NO_SMOKE=1; shift ;;
-    -h|--help)      awk 'NR>2 && /^# ═/{exit} NR>2 {sub(/^# ?/,""); print}' "$0"; exit 0 ;;
+    -h|--help)      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
     *) printf '未知参数: %s\n用法见: bash %s --help\n' "$1" "$0" >&2; exit 1 ;;
   esac
 done
@@ -90,13 +94,57 @@ fetch_first() {
   return 1
 }
 
+# ── 版本号自动解析（与 build-offline.sh 同一套规则）────────────────────────
+# auto/latest → dist-tags.<DSH_DIST_TAG>；next/alpha 等 → 同名 tag；
+# 具体版本（0.2.2-rc.1）→ 手动锁定，不联网。直接改写全局 DSH_VERSION。
+DSH_VERSION_SOURCE="pinned"
+resolve_dsh_version() {
+  local raw="$DSH_VERSION" tag v reg url tmp
+  case "$raw" in
+    ""|auto|latest|@latest) tag="$DSH_DIST_TAG" ;;
+    next|alpha|beta|rc|canary) tag="$raw" ;;
+    *) DSH_VERSION_SOURCE="pinned"; return 0 ;;
+  esac
+  tmp="$(mktemp "${TMPDIR:-/tmp}/dsh-dist-tags.XXXXXX" 2>/dev/null || printf '%s' "$LAB/dist-tags.json")"
+  for reg in "$NPM_REGISTRY" "$NPM_REGISTRY_FALLBACK"; do
+    url="${reg%/}/-/package/@deepseek-ai/dsh/dist-tags"
+    if fetch "$url" "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      v="$(sed -n 's/.*"'"$tag"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" 2>/dev/null | head -1)"
+      if [ -z "$v" ] && command -v node >/dev/null 2>&1; then
+        v="$(node -e '
+          const fs = require("fs");
+          try {
+            const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const x = j[process.argv[2]];
+            if (typeof x === "string" && x) process.stdout.write(x);
+          } catch {}
+        ' "$tmp" "$tag" 2>/dev/null)"
+      fi
+      if [ -n "$v" ]; then
+        DSH_VERSION="$v"; DSH_VERSION_SOURCE="registry:$tag"
+        rm -f "$tmp"; return 0
+      fi
+    fi
+  done
+  rm -f "$tmp"
+  for reg in "$NPM_REGISTRY" "$NPM_REGISTRY_FALLBACK"; do
+    v="$(npm view '@deepseek-ai/dsh' "dist-tags.$tag" --registry "$reg" 2>/dev/null \
+         | tail -1 | tr -d "'\" \r")"
+    if [ -n "$v" ]; then
+      DSH_VERSION="$v"; DSH_VERSION_SOURCE="npm-view:$tag"; return 0
+    fi
+  done
+  return 1
+}
+
 # 版本比较：ver_ge <a> <b> → a >= b 返回 0
 ver_ge() {
   local a="${1#v}" b="${2#v}"
   [ "$(printf '%s\n%s\n' "$b" "$a" | sort -V | head -1)" = "$b" ]
 }
 
-# dsh 要求：node ^22.19.0 || >=24.0.0
+# dsh 0.2.2-rc.1 起要求 node >=24.9.0；老版本 dsh 在 24 上同样能跑，
+# 所以统一按 24.9+ 判定，避免实验脚本复用系统里过旧的 Node 22。
 node_ok() {
   local v major minor
   v="$(node --version 2>/dev/null)" || return 1
@@ -104,14 +152,13 @@ node_ok() {
   major="${v%%.*}"
   minor="$(printf '%s' "$v" | cut -d. -f2)"
   case "$major" in
-    22) [ "${minor:-0}" -ge 19 ] ;;
-    24|25|26) return 0 ;;
+    24) [ "${minor:-0}" -ge 9 ] ;;
+    2[5-9]|[3-9][0-9]) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 say "① 预检：环境"
-printf '  · 实验目录 %s · 目标版本 %s\n' "$LAB" "$DSH_VERSION"
 printf '  · 系统：%s %s\n' "$(uname -s)" "$(uname -m)"
 command -v tar >/dev/null 2>&1 || die "缺少 tar"
 if [ "$FROM_SOURCE" = "1" ]; then
@@ -119,23 +166,36 @@ if [ "$FROM_SOURCE" = "1" ]; then
 fi
 ok "基础命令齐备"
 
+say "①-b 解析 dsh 版本（自动取 npm 最新版）"
+resolve_dsh_version \
+  || die "自动解析 dsh 版本失败（$NPM_REGISTRY / $NPM_REGISTRY_FALLBACK 都查不到 dist-tags）。
+  请显式指定：--version 0.2.2-rc.1  或  DSH_VERSION=0.2.2-rc.1"
+case "$DSH_VERSION_SOURCE" in
+  pinned) ok "手动锁定：dsh $DSH_VERSION" ;;
+  *)      ok "自动解析（${DSH_VERSION_SOURCE}）：dsh $DSH_VERSION" ;;
+esac
+printf '  · 实验目录 %s\n' "$LAB"
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  printf 'dsh_version=%s\n' "$DSH_VERSION" >> "$GITHUB_OUTPUT"
+fi
+
 # ── ② 准备 Node ───────────────────────────────────────────────────────────
 say "② 准备 Node 运行时"
 if node_ok; then
   ok "复用系统 Node $(node --version)"
   NODE_DIR="$(dirname "$(command -v node)")"
 else
-  warn "系统 Node 不满足要求（需 ^22.19.0 或 >=24），下载独立工具链 $NODE_TOOLCHAIN_VER"
+  warn "系统 Node 不满足要求（需 >=24.9.0），下载独立工具链 $NODE_TOOLCHAIN_VER"
   MACH="$(uname -m)"
   case "$MACH" in
     x86_64|amd64) NODE_ARCH_TC="x64" ;;
     aarch64|arm64) NODE_ARCH_TC="arm64" ;;
-    *) die "未知 CPU 架构 $MACH：请自行安装 Node 22.19+ 或 24+ 后重跑" ;;
+    *) die "未知 CPU 架构 $MACH：请自行安装 Node 24.9+ 后重跑" ;;
   esac
   case "$(uname -s)" in
     Linux)  TC_OS="linux" ;;
     Darwin) TC_OS="darwin" ;;
-    *) die "非 Linux/macOS 系统，请自行安装 Node 22.19+ 或 24+ 后重跑" ;;
+    *) die "非 Linux/macOS 系统，请自行安装 Node 24.9+ 后重跑" ;;
   esac
   TC_DIR="$LAB/toolchain"
   mkdir -p "$TC_DIR"
