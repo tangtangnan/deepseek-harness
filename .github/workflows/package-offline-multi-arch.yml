@@ -9,11 +9,22 @@
 #   offline-amd64 / offline-arm64       单架构包
 #   offline-all-arch                    两包 + sha256 + MANIFEST（推荐下这个）
 #
+# 【版本】默认 version=auto：由 build-offline.sh 在构建时读
+#   @deepseek-ai/dsh 的 npm dist-tags.latest，不会再停在 rc.2。
+#   想冻结填具体版本号（0.2.1-rc.2），想追预发布把 dist_tag 设为 next / alpha。
+#   内置 Node 运行时也会按该版本 dsh 的 engines.node 自动匹配
+#   （0.2.2-rc.1 起要求 Node >=24.9.0，仍内置 v22 会打不出能跑的包）。
+#
+# 【插件】默认预装 @deepseek-ai/dsh-subagent-codex 与
+#   @deepseek-ai/dsh-subagent-claude-code，版本与 dsh 对齐。
+#   关掉 include_subagents，或打开 slim，就不带这两个。
+#
 # 【注意】
 #   · arm64 runner（ubuntu-24.04-arm）仅对 Public 仓库免费；
-#   · 两包合计约 700MB~1GB，Artifact 只保留 90 天（inputs.retention 可调），
+#   · 两包合计约 700MB~1GB+（两个 subagent 带平台二进制，比原来更大），
+#     Artifact 只保留 90 天（inputs.retention 可调），
 #     建议勾 publish_release 生成 Draft Release 长期保存；
-#   · 插件预装（默认开）会让包大 ~300MB，想瘦身把 inputs.slim 设为 true。
+#   · slim 跳过 profile 插件预装，包能小 ~300MB+。
 # ═══════════════════════════════════════════════════════════════════════════
 name: Package dsh offline (amd64 + arm64)
 
@@ -21,17 +32,28 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'dsh 版本'
+        description: 'dsh 版本：auto=自动取 npm 最新版；填 0.2.1-rc.2 可锁定；next/alpha 追标签'
         required: false
-        default: '0.2.1-rc.2'
+        default: 'auto'
+      dist_tag:
+        description: 'version=auto 时读取哪个 npm dist-tag'
+        required: false
+        default: 'latest'
+        type: choice
+        options: [latest, next, alpha]
       arch:
         description: '构建哪些架构'
         required: false
         default: 'both'
         type: choice
         options: [both, amd64, arm64]
+      include_subagents:
+        description: '默认预装两个 subagent 插件（codex + claude-code）'
+        required: false
+        default: true
+        type: boolean
       slim:
-        description: '跳过 profile 插件预装（包更小，离线机启动会尝试拉插件后跳过）'
+        description: '跳过 profile 插件预装（同时也不带两个 subagent）'
         required: false
         default: false
         type: boolean
@@ -49,11 +71,59 @@ permissions:
   contents: write
 
 jobs:
+  # 版本号只在这里解析一次：两个架构用同一个值，release tag 也用同一个值。
+  # 直接调用 build-offline.sh --print-version，逻辑与本地构建完全一致。
+  resolve:
+    name: Resolve dsh version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Locate kit script
+        id: kit
+        run: |
+          for d in tools/offline-kit offline-kit .; do
+            if [ -f "$d/build-offline.sh" ]; then
+              echo "dir=$d" >> "$GITHUB_OUTPUT"
+              echo "找到脚本：$d/build-offline.sh"
+              exit 0
+            fi
+          done
+          echo "::error::找不到 build-offline.sh。请上传到以下任一位置：tools/offline-kit/ 、offline-kit/ 、或仓库根目录"
+          exit 1
+
+      - name: Resolve version from npm
+        id: ver
+        env:
+          DSH_VERSION: ${{ inputs.version }}
+          DSH_DIST_TAG: ${{ inputs.dist_tag }}
+        run: |
+          set -uo pipefail
+          V="$(bash "${{ steps.kit.outputs.dir }}/build-offline.sh" --print-version)"
+          case "$V" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::解析到的版本号不合法：$V"; exit 1 ;;
+          esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "### 本次构建" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- dsh 版本：\`$V\`（输入：\`${{ inputs.version }}\` / tag：\`${{ inputs.dist_tag }}\`）" >> "$GITHUB_STEP_SUMMARY"
+          echo "- subagent 插件：\`${{ inputs.include_subagents }}\`" >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON((github.event.inputs.arch || 'both') == 'both' && '{"include":[{"arch":"amd64","runner":"ubuntu-latest","elf":"x86-64"},{"arch":"arm64","runner":"ubuntu-24.04-arm","elf":"ARM aarch64"}]}' || (github.event.inputs.arch || 'both') == 'amd64' && '{"include":[{"arch":"amd64","runner":"ubuntu-latest","elf":"x86-64"}]}' || '{"include":[{"arch":"arm64","runner":"ubuntu-24.04-arm","elf":"ARM aarch64"}]}') }}
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.arch }} (dsh ${{ needs.resolve.outputs.version }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
 
@@ -61,10 +131,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node 22
+      - name: Setup Node 24
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Prepare pnpm (profile plugin seeding)
         run: |
@@ -90,20 +160,22 @@ jobs:
         run: |
           echo "arch  : $(uname -m)"
           echo "node  : $(node --version)  npm: $(npm --version)"
+          echo "dsh   : ${{ needs.resolve.outputs.version }}"
           echo "脚本目录: ${{ steps.kit.outputs.dir }}"
           df -h "$HOME" | tail -1
 
       - name: Build offline package
         env:
-          DSH_VERSION: ${{ inputs.version }}
+          DSH_VERSION: ${{ needs.resolve.outputs.version }}
           # build-offline.sh 默认把产物写到「脚本所在目录」的 release/
-          # （tools/offline-kit/release），而后续 Verify/Upload 都在仓库根找 release/。
+          #（tools/offline-kit/release），而后续 Verify/Upload 都在仓库根找 release/。
           # 显式指定 OUT 让产物落到仓库根，两边的路径约定就一致了。
           OUT: release
         run: |
           set -uo pipefail
           FLAGS="--arch ${{ matrix.arch }}"
           [ "${{ inputs.slim }}" = "true" ] && FLAGS="$FLAGS --slim"
+          [ "${{ inputs.include_subagents }}" = "true" ] || FLAGS="$FLAGS --no-extra-plugins"
           bash "${{ steps.kit.outputs.dir }}/build-offline.sh" --version "${DSH_VERSION}" $FLAGS
 
       - name: Confirm tarball location
@@ -132,7 +204,38 @@ jobs:
           ls "$DIR"/kernel/node_modules/node-pty/build/Release/pty.node 2>/dev/null \
             || ls -d "$DIR"/kernel/node_modules/node-pty/prebuilds/*/ 2>/dev/null \
             || echo "  ⚠ node-pty 未产出二进制（终端功能可能不可用）"
-          echo "④ 依赖规模"
+          echo "④ 内置 Node 是否满足该版本 dsh 的 engines.node"
+          "$DIR/runtime/bin/node" -e '
+            const fs = require("fs");
+            const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const e = d.engines?.node || "(未声明)";
+            console.log("  dsh " + d.version + " requires node " + e + "; bundled v" + process.versions.node);
+            const m = String(e).match(/(\d+)\./);
+            if (m && Number(process.versions.node.split(".")[0]) < Number(m[1])) {
+              console.log("::error::内置 Node 版本过低，dsh 起不来"); process.exit(1);
+            }
+          ' "$DIR/kernel/node_modules/@deepseek-ai/dsh/package.json"
+          echo "⑤ 默认两个 subagent 插件"
+          if [ "${{ inputs.include_subagents }}" = "true" ] && [ "${{ inputs.slim }}" != "true" ]; then
+            for p in "@deepseek-ai/dsh-subagent-codex" "@deepseek-ai/dsh-subagent-claude-code"; do
+              if [ -f "$DIR/home-template/profiles/web/node_modules/$p/package.json" ]; then
+                echo "  OK $p"
+              else
+                echo "::error::包内缺少默认插件 $p"; exit 1
+              fi
+            done
+            "$DIR/runtime/bin/node" -e '
+              const fs = require("fs");
+              const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+              const b = j.dsh?.profile?.bundles || [];
+              for (const n of ["@deepseek-ai/dsh-subagent-codex", "@deepseek-ai/dsh-subagent-claude-code"])
+                if (!b.includes(n)) { console.log("::error::" + n + " 未写入 dsh.profile.bundles"); process.exit(1); }
+              console.log("  OK dsh.profile.bundles 已含两个插件");
+            ' "$DIR/home-template/profiles/web/package.json"
+          else
+            echo "  跳过（include_subagents=false 或 slim=true）"
+          fi
+          echo "⑥ 依赖规模"
           echo "  @deepseek-ai/* : $(ls -1 "$DIR/kernel/node_modules/@deepseek-ai" | wc -l) 个"
           du -sh "$DIR"
 
@@ -146,8 +249,8 @@ jobs:
 
   publish:
     name: Collect all architectures
-    needs: build
-    if: ${{ !cancelled() }}
+    needs: [resolve, build]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -176,17 +279,21 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          tag_name: offline-${{ inputs.version }}-${{ github.run_number }}
-          name: DeepSeek Harness offline ${{ inputs.version }}
+          tag_name: offline-${{ needs.resolve.outputs.version }}-${{ github.run_number }}
+          name: DeepSeek Harness offline ${{ needs.resolve.outputs.version }}
           body: |
             全离线便携包（免 root / 免网络 / 免包管理器）
+
+            - dsh 版本：`${{ needs.resolve.outputs.version }}`（构建时自动取 npm 最新，非写死）
+            - 内置 Node：按该版本 `engines.node` 自动匹配
+            - 默认预装：`@deepseek-ai/dsh-subagent-codex`、`@deepseek-ai/dsh-subagent-claude-code`
 
             ```
             tar -xzf deepseek-harness-<version>-offline-<arch>.tar.gz
             cd deepseek-harness-<version>-offline-<arch>
             bash install.sh
-            dsh web --no-open        # http://127.0.0.1:3080
+            dsh web --no-open        # 用 Firefox/Chrome 打开日志里带 ?token= 的 URL
             ```
 
-            校验：同目录 `.sha256` 文件。
+            校验：同目录 `.sha256`；详细版本与插件清单看 `.MANIFEST.txt`。
           files: all/*

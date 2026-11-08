@@ -27,9 +27,15 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'dsh 版本'
+        description: 'dsh 版本：auto=自动取 npm 最新版；填 0.2.1-rc.2 可锁定；next/alpha 追标签'
         required: false
-        default: '0.2.1-rc.2'
+        default: 'auto'
+      dist_tag:
+        description: 'version=auto 时读取哪个 npm dist-tag'
+        required: false
+        default: 'latest'
+        type: choice
+        options: [latest, next, alpha]
       arch:
         description: '跑哪些架构'
         required: false
@@ -65,10 +71,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node 22
+      - name: Setup Node 24
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          # dsh 0.2.2-rc.1 起 engines.node >=24.9.0
+          node-version: '24'
 
       - name: Locate kit script
         id: kit
@@ -104,6 +111,7 @@ jobs:
         id: exp
         env:
           DSH_VERSION: ${{ inputs.version }}
+          DSH_DIST_TAG: ${{ inputs.dist_tag }}
         run: |
           set -uo pipefail
           FLAGS=""
@@ -112,6 +120,9 @@ jobs:
           mkdir -p "$HOME/.dsh-lab"
           bash "${{ steps.kit.outputs.dir }}/experiment.sh" --version "${DSH_VERSION}" $FLAGS \
             2>&1 | tee "$HOME/.dsh-lab/run.log"
+          # experiment.sh 会把解析后的版本写进 $GITHUB_OUTPUT；同一 step 内
+          # 还没法用 steps.exp.outputs.*，直接从文件里读出来打印
+          grep '^dsh_version=' "$GITHUB_OUTPUT" 2>/dev/null | tail -1 || true
           # 脚本会打印 SMOKE=1 / SMOKE=0 / SMOKE=SKIP 供下一步判定
           SMOKE="$(grep -o '^SMOKE=[A-Za-z0-9]*' "$HOME/.dsh-lab/run.log" | tail -1 | cut -d= -f2)"
           echo "smoke=${SMOKE:-SKIP}" >> "$GITHUB_OUTPUT"
@@ -127,10 +138,27 @@ jobs:
       - name: Collect logs
         if: always()
         run: |
-          # artifact 路径不展开 ~，先把日志拷到工作区
-          # （不需要 pkill：脚本自己会用 trap 收掉起的服务）
+          # ⚠️ 别用 cp -r "$HOME/.dsh-lab"/. ：那会把 600+ 包的 node_modules 也收进来，
+          #    artifact 直接膨胀到 200MB+，还会被误认成「离线包」。这里只收日志与诊断快照。
           mkdir -p dsh-lab-logs
-          cp -r "$HOME/.dsh-lab"/. dsh-lab-logs/ 2>/dev/null || true
+          find "$HOME/.dsh-lab" -maxdepth 1 -type f \( -name '*.log' -o -name '*.txt' \) \
+            -exec cp {} dsh-lab-logs/ \; 2>/dev/null || true
+          {
+            echo "=== $(uname -m) · $(node --version) ==="
+            echo "① dsh 版本"
+            ls -1 "$HOME/.dsh-lab/app/node_modules/@deepseek-ai/dsh/package.json" >/dev/null 2>&1 \
+              && node -p "require('$HOME/.dsh-lab/app/node_modules/@deepseek-ai/dsh/package.json').version" 2>/dev/null \
+              || echo "  (未安装)"
+            echo "② @deepseek-ai 包数量"
+            ls -1 "$HOME/.dsh-lab/app/node_modules/@deepseek-ai" 2>/dev/null | wc -l
+            echo "③ 原生模块"
+            ls -d "$HOME/.dsh-lab"/app/node_modules/@deepseek-ai/node-addon-system-* 2>/dev/null \
+              | xargs -n1 basename 2>/dev/null || echo "  ⚠ 无"
+            ls "$HOME/.dsh-lab"/app/node_modules/node-pty/prebuilds/*/pty.node 2>/dev/null \
+              | sed 's/^/  pty: /' || echo "  ⚠ node-pty 无预编译二进制"
+          } > dsh-lab-logs/env.txt 2>&1
+          echo "--- 产物清单（应该只有几 KB）---"
+          ls -lh dsh-lab-logs/
           true
 
       - name: Upload experiment logs
@@ -141,3 +169,24 @@ jobs:
           path: dsh-lab-logs/**
           if-no-files-found: warn
           retention-days: 7
+
+      # 很多人把 experiment-logs-*.zip 当成安装包，这里显式说明
+      - name: Final note (this workflow does NOT produce a package)
+        if: always()
+        run: |
+          {
+            echo "## ⚠️ 这是「实验」，不是安装包"
+            echo ""
+            echo "本 workflow 只在云端跑一遍 \`npm install\` + 可选冒烟，**不产出任何离线包**。"
+            echo "产物 \`experiment-logs-${{ matrix.arch }}.zip\` 里全是安装日志，里面没有 install.sh。"
+            echo ""
+            echo "### 要拿可安装的离线包，请改跑这一个："
+            echo ""
+            echo "> **Actions → Package dsh offline (amd64 + arm64) → Run workflow**"
+            echo ""
+            echo "| 对比 | 本 workflow | Package dsh offline |"
+            echo "|---|---|---|"
+            echo "| 产物 | \`experiment-logs-<arch>.zip\`（日志） | \`deepseek-harness-<版本>-offline-<arch>.tar.gz\` |"
+            echo "| 能装吗 | ❌ 不能 | ✅ 解压后 \`bash install.sh\` |"
+            echo "| 耗时 | 2~5 分钟 | 30~60 分钟 |"
+          } >> "$GITHUB_STEP_SUMMARY"
