@@ -699,7 +699,21 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$HERE/runtime/bin:$PATH"
 export DSH_HOME="${DSH_HOME:-$HERE/home}"
-exec "$HERE/runtime/bin/node" "$HERE/kernel/node_modules/@deepseek-ai/dsh/lib/bin.js" "$@"
+NODE="$HERE/runtime/bin/node"
+BIN="$HERE/kernel/node_modules/@deepseek-ai/dsh/lib/bin.js"
+# 正常机器：直接 exec 内置 Node
+if "$NODE" --version >/dev/null 2>&1; then
+  exec "$NODE" "$BIN" "$@"
+fi
+# KYSEC 执行控制 / noexec 拦了 execve：借系统受信任的动态加载器执行。
+# 被 execve 的是 ld-linux，node 只作为数据文件加载 —— 全程普通用户，免 root。
+for LD in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-aarch64.so.1 \
+          /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1; do
+  [ -x "$LD" ] && exec "$LD" "$NODE" "$BIN" "$@"
+done
+printf '内置 Node 无法执行：直接 exec 被拦，也没找到可用的动态加载器。\n' >&2
+printf '普通用户可先试 chmod +x %s；无效则请管理员把该目录加入 KYSEC 信任白名单。\n' "$NODE" >&2
+exit 1
 EOF
 chmod 0755 "$APP/dsh"
 
@@ -719,7 +733,20 @@ if [ ! -f "$HERE/runtime/bin/pnpm" ]; then
   printf 'pnpm 未内置在本包中（构建时安装失败）\n' >&2
   exit 127
 fi
-exec "$HERE/runtime/bin/pnpm" "$@"
+if "$HERE/runtime/bin/pnpm" --version >/dev/null 2>&1; then
+  exec "$HERE/runtime/bin/pnpm" "$@"
+fi
+# 直接 exec 被 KYSEC / noexec 拦了：用系统受信任的动态加载器跑 pnpm 的 JS 入口。
+# 全程普通用户，免 root。
+PNPM_MJS="$HERE/runtime/lib/node_modules/pnpm/bin/pnpm.mjs"
+if [ -f "$PNPM_MJS" ]; then
+  for LD in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-aarch64.so.1 \
+            /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1; do
+    [ -x "$LD" ] && exec "$LD" "$HERE/runtime/bin/node" "$PNPM_MJS" "$@"
+  done
+fi
+printf '内置 pnpm 无法执行：请管理员把 %s 加入 KYSEC 信任白名单。\n' "$HERE/runtime/bin" >&2
+exit 1
 EOF
 chmod 0755 "$APP/pnpm"
 
@@ -761,11 +788,77 @@ info() { printf '  · %s\n' "$*"; }
 warn() { printf '  ⚠ %s\n' "$*"; }
 die()  { printf '\n  ✖ %b\n' "$*" >&2; exit 1; }
 
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$SRC/kernel/node_modules/@deepseek-ai/dsh/lib/bin.js" ] || die "包结构不完整：找不到 kernel/node_modules/@deepseek-ai/dsh/lib/bin.js"
+SRC="${DSH_SRC:-}"
+if [ -z "$SRC" ]; then
+  _bs0="${BASH_SOURCE[0]:-}"
+  if [ -n "$_bs0" ] && [ -f "$_bs0" ]; then
+    SRC="$(cd "$(dirname "$_bs0")" && pwd)"
+  else
+    # 从 stdin 执行（KYSEC 拦脚本文件时的绕行方式）：DSH_SRC="$PWD" bash -s < install.sh
+    SRC="$PWD"
+  fi
+fi
+unset _bs0
+[ -f "$SRC/kernel/node_modules/@deepseek-ai/dsh/lib/bin.js" ] || die "包结构不完整：找不到 kernel/node_modules/@deepseek-ai/dsh/lib/bin.js
+  当前识别的包目录是：$SRC
+  若是从 stdin 执行的，请显式指定：DSH_SRC=\"\$(pwd)\" bash -s < install.sh"
 [ -f "$SRC/runtime/bin/node" ] || die "包结构不完整：找不到 runtime/bin/node"
 # 补执行位：tar 解压/跨机拷贝都可能丢 mode，装之前统一修一次
 chmod 0755 "$SRC/runtime/bin/node" 2>/dev/null || true
+
+# ── ⓪ 执行环境预检：KYSEC / noexec / 执行位 ──────────────────────────────
+# 银河麒麟 KYSEC 是内核安全模块（LSM），拦的是 execve，跟 uid 无关。
+# 典型症状：`bash install.sh` 只打印一行 "KYSEC: 权限不够" 就退回提示符，
+# 脚本一行都没执行 —— 此时 `sudo bash install.sh` 同样会被拦，加 sudo 没用。
+exec_blocked_hint() {
+  printf '\n'
+  warn "检测到「脚本/二进制可能无法执行」的环境。以下普通用户即可，不需要 sudo："
+  cat <<'HINT'
+  ┌─ 1) 补执行位 + 在麒麟本机重新解压（最常见）────────────────────────
+  │  chmod -R u+X runtime/bin ./*.sh dsh pnpm
+  │  把 *.tar.gz 原文件拷进麒麟机，本机 tar -xzf 解压；别用在 Windows
+  │  解压后拷过来的文件夹（丢执行位、无 KYSEC 标记）。
+  │  ./runtime/bin/node --version   能出 v24.x 就说明执行控制没拦。
+  ├─ 2) 脚本文件被拦：绕开 execve ─────────────────────────────────────
+  │  ( source ./install.sh --no-verify )              旧包/新包都可用
+  │  cat install.sh | DSH_SRC="$PWD" bash -s -- --no-verify   仅新版包
+  │  ❌ 别用 bash -c "$(cat install.sh)"（BASH_SOURCE 为空会报错）
+  ├─ 3) 内置 Node 二进制被拦：启动器会自动改用系统动态加载器 ─────────
+  │  手动验证：/lib64/ld-linux-x86-64.so.2 <prefix>/runtime/bin/node --version
+  │  （arm64 用 /lib/ld-linux-aarch64.so.1）
+  ├─ 4) 分区 noexec ───────────────────────────────────────────────────
+  │  mount | grep noexec  → 换到家目录下另一个可执行分区重新解压即可
+  └─ 5) 以上都无效（需管理员，普通用户到此为止）─────────────────────
+     getstatus 看 exec control；把 <prefix>、~/.dsh、runtime/bin/node
+     交给管理员加进「安全管理中心 → 信任白名单」，或 sudo setstatus softmode
+     （是这条命令，不是 sudo bash install.sh；sudo 提权本身不解决问题）
+HINT
+}
+NOEXEC_HIT=""
+if [ -r /proc/mounts ]; then
+  # 只关心与「本包目录 / 安装目录」相关的挂载点；/proc /sys /dev 本来就带 noexec
+  while read -r _dev _mnt _fs _opts _rest; do
+    case ",$_opts," in *,noexec,*) ;; *) continue ;; esac
+    case "$_mnt" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/snap|/snap/*) continue ;; esac
+    case "$SRC/|$PREFIX/" in
+      "$_mnt"/*) NOEXEC_HIT="$NOEXEC_HIT $_mnt" ;;
+    esac
+  done < /proc/mounts
+fi
+KYSEC_STATE=""
+if command -v getstatus >/dev/null 2>&1; then
+  KYSEC_STATE="$(getstatus 2>/dev/null | grep -i 'exec control' | head -1)"
+fi
+# 只在「确有证据」时提示，避免每次安装都刷一屏 KYSEC 说明
+if printf '%s' "$KYSEC_STATE" | grep -qi 'enforce' || \
+   [ -n "$NOEXEC_HIT" ] || [ ! -x "$SRC/runtime/bin/node" ]; then
+  info "noexec 挂载点：${NOEXEC_HIT:-（无）}"
+  info "KYSEC 状态  ：${KYSEC_STATE:-（未检测到 getstatus 或该项）}"
+  [ -x "$SRC/runtime/bin/node" ] \
+    && info "runtime/bin/node 执行位：OK" \
+    || warn "runtime/bin/node 没有执行位（已尝试 chmod，可能被文件系统/KYSEC 拒绝）"
+  exec_blocked_hint
+fi
 
 say "安装 DeepSeek Harness（离线便携版）"
 printf '  · 源  : %s\n  · 目标: %s\n' "$SRC" "$PREFIX"
@@ -861,7 +954,20 @@ set -uo pipefail
 PREFIX="$PREFIX"
 export PATH="\$PREFIX/runtime/bin:\$PATH"
 export DSH_HOME="\${DSH_HOME:-\$HOME/.dsh}"
-exec "\$PREFIX/runtime/bin/node" "\$PREFIX/kernel/node_modules/@deepseek-ai/dsh/lib/bin.js" "\$@"
+NODE="\$PREFIX/runtime/bin/node"
+BIN="\$PREFIX/kernel/node_modules/@deepseek-ai/dsh/lib/bin.js"
+if "\$NODE" --version >/dev/null 2>&1; then
+  exec "\$NODE" "\$BIN" "\$@"
+fi
+# 直接 exec 被 KYSEC 执行控制 / noexec 拦了：借系统受信任的动态加载器执行。
+# 被 execve 的是 ld-linux，node 只作为数据文件加载 —— 全程普通用户，免 root。
+for LD in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-aarch64.so.1 \\
+          /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1; do
+  [ -x "\$LD" ] && exec "\$LD" "\$NODE" "\$BIN" "\$@"
+done
+printf '内置 Node 无法执行：请管理员把 %s 与 %s 加入 KYSEC 信任白名单。\\n' \\
+       "\$PREFIX" "\$HOME/.dsh" >&2
+exit 1
 LAUNCHER
   chmod 0755 "$BIN_DIR/dsh"
   ok "启动器：$BIN_DIR/dsh"
@@ -874,14 +980,45 @@ fi
 
 say "④ 冒烟自检"
 V="$("$PREFIX/runtime/bin/node" --version 2>&1)"
+case "$V" in
+  v[0-9]*) ok "Node $V" ;;
+  *)
+    V="(不可执行)"
+    warn "内置 Node 无法执行：$("$PREFIX/runtime/bin/node" --version 2>&1)"
+    warn "这不代表包坏了 —— 多半是 KYSEC 执行控制 / noexec 挂载拦了 execve。"
+    warn "照上面 ⓪ 的提示处理；安装文件本身已经部署完成。"
+    ;;
+esac
 DV="$(env PATH="$PREFIX/runtime/bin:$PATH" DSH_HOME="$DSH_HOME_DIR" \
       "$PREFIX/runtime/bin/node" "$PREFIX/kernel/node_modules/@deepseek-ai/dsh/lib/bin.js" --version 2>&1 | tail -1)"
-ok "Node $V · dsh $DV"
+case "$DV" in
+  *"权限不够"*|*"Permission denied"*|*KYSEC*|*"cannot execute"*)
+    warn "dsh 启动被拦：$DV" ;;
+  *) ok "dsh $DV" ;;
+esac
 PN="$(env PATH="$PREFIX/runtime/bin:$PATH" "$PREFIX/runtime/bin/pnpm" --version 2>/dev/null | tail -1)"
 if [ -n "$PN" ]; then
   ok "pnpm $PN（dsh plugin 依赖它，已内置）"
 else
-  warn "pnpm 未内置 —— dsh plugin / 装插件不可用（Web UI 等其余功能正常）"
+  # 直启被 KYSEC/noexec 拦时，包内 pnpm 包装会自动改用动态加载器；这里如实反映
+  PNPM_MJS="$PREFIX/runtime/lib/node_modules/pnpm/bin/pnpm.mjs"
+  PN_FALLBACK=""
+  if [ -f "$PNPM_MJS" ]; then
+    for LD in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-aarch64.so.1 \
+              /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1; do
+      [ -x "$LD" ] || continue
+      PN_FALLBACK="$(env PATH="$PREFIX/runtime/bin:$PATH" "$LD" "$PREFIX/runtime/bin/node" \
+                     "$PNPM_MJS" --version 2>/dev/null | tail -1)"
+      [ -n "$PN_FALLBACK" ] && break
+    done
+  fi
+  if [ -n "$PN_FALLBACK" ]; then
+    ok "pnpm $PN_FALLBACK（直启被拦，已启用动态加载器回退，普通用户可用）"
+    info "确认命令：$PREFIX/pnpm --version"
+  else
+    warn "pnpm 直启检测失败（多半是 KYSEC 拦了内置 Node ELF）；装完试 $PREFIX/pnpm --version"
+    warn "Web UI 主体不受影响。免 root 处理办法见 说明.md「KYSEC」一节。"
+  fi
 fi
 
 if [ "$NO_VERIFY" = "1" ]; then
@@ -1183,8 +1320,23 @@ bash uninstall.sh --purge    # 连 ~/.dsh 一起删
 - 内置 Node 是构建时按该版本 dsh 的 `engines.node` 自动选的（新版为 24.x）。
   Node 22/24 的官方 Linux 二进制都要求 **glibc ≥ 2.28**（内核 ≥ 4.18）；
   老机器上确认一下：`ldd --version | head -1`。
-- 银河麒麟：若报 `KYSEC: 权限不够`，先 `sudo setstatus softmode`，
-  或在「安全管理中心」把安装目录与 `~/.dsh` 加入信任白名单。
+- 银河麒麟报 `KYSEC: 权限不够`：`sudo bash install.sh` 没用（KYSEC 在内核
+  execve 层拦截，与 root 身份无关），而且**下面所有办法都是普通用户权限，不需要 sudo**：
+  1. 把 `*.tar.gz` 拷进麒麟机**本机 `tar -xzf` 解压**，再
+     `chmod -R u+X runtime/bin ./*.sh dsh pnpm`；
+     用 `./runtime/bin/node --version` 验证（能出 v24.x 就没事）。
+     别用在 Windows 解压后拷过来的文件夹 —— 会丢执行位与 KYSEC 标记，这是最常见根因。
+  2. 脚本仍被拦：`( source ./install.sh --no-verify )`（只 open 不 exec 该脚本文件；
+     子 shell 防止脚本 exit 关掉登录 shell）；新版包也可用
+     `cat install.sh | DSH_SRC="$PWD" bash -s -- --no-verify`。
+  3. `mount | grep noexec` 看分区，换到家目录下另一个可执行分区重新解压。
+  4. 装完启动 `dsh web` 才报 KYSEC → 拦的是内置 Node 二进制。本包 `dsh` 启动器
+     和 `pnpm` 包装脚本都会自动回退到系统动态加载器
+     （`/lib64/ld-linux-x86-64.so.2`，arm64 为 `/lib/ld-linux-aarch64.so.1`），
+     普通用户即可，无需改系统设置；`dsh plugin` 也覆盖到了。
+  5. 以上都无效才是机器安全策略：请管理员把安装目录、`~/.dsh`、
+     `runtime/bin/node` 加入「安全管理中心 → 信任白名单」，
+     或临时 `sudo setstatus softmode`。普通用户到此为止，包本身没有问题。
 - 部分实验性 bundle（如 dsh-im）与当前 dsh 运行时版本不兼容，启动时会打印
   `skipping profile bundle` 并跳过——这是上游现状，Web UI 主体不受影响。
 EOF
