@@ -42,6 +42,16 @@ on:
         options: ['3', '7']
         default: '3'
         required: true
+      include_subagents:
+        description: '随安装包内置两个官方 subagent 插件（Codex / Claude Code）；离线即可在插件管理器开启'
+        type: boolean
+        default: true
+        required: false
+      enable_subagents:
+        description: '把两个插件写入 web profile 模板，安装后默认启用（需 include_subagents=true）'
+        type: boolean
+        default: true
+        required: false
       signing:
         description: '签名方式：unsigned 仅限内部调试，禁止发布到 test / production 或用于自动更新；需要发布请选择 signed（EV 硬件令牌）'
         type: choice
@@ -137,6 +147,35 @@ jobs:
           }
           if(!fs.readFileSync('apps/desktop/scripts/retain-desktop-ci.ts','utf8').includes('--check-runner')) throw Error('Source lacks independent Desktop artifact archival support; select a newer source');
           if(!fs.readFileSync('apps/desktop/scripts/desktop-ci-version.mjs','utf8').includes('PACKAGE_VERSION_MODE')) throw Error('Source lacks Desktop channel/version CI support; select a newer release');"
+      # 两个 subagent 插件本来就会被 release:pack 打进 packedDsh，只是 Desktop
+      # core package set 的闭包根没有引用它们，所以默认不进安装包。这里把闭包根补上，
+      # 并按开关把它们写进 web profile 模板（默认启用）。只改源码、不动依赖图，
+      # 因此 pnpm install --frozen-lockfile 与 release:pack 的校验都不受影响。
+      - name: Bundle official subagent plugins
+        if: ${{ inputs.include_subagents }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $enc = [Text.UTF8Encoding]::new($false)
+          $names = "'@deepseek-ai/dsh-subagent-codex', '@deepseek-ai/dsh-subagent-claude-code'"
+
+          $setPath = 'apps/desktop/scripts/prepare-package-set.ts'
+          $setText = [IO.File]::ReadAllText($setPath, $enc)
+          $setOld = 'const ROOT_PACKAGES = [DSH_PACKAGE, DESKTOP_HOST_PACKAGE] as const'
+          if (-not $setText.Contains($setOld)) { throw "Unexpected $setPath layout - check ROOT_PACKAGES" }
+          $setText = $setText.Replace($setOld, "const ROOT_PACKAGES = [DSH_PACKAGE, DESKTOP_HOST_PACKAGE, $names] as const")
+          [IO.File]::WriteAllText($setPath, $setText, $enc)
+          "patched: $setPath"
+
+          if ('${{ inputs.enable_subagents }}' -eq 'true') {
+            $tplPath = 'packages/util/official-bundles/src/bundles.ts'
+            $tplText = [IO.File]::ReadAllText($tplPath, $enc)
+            $tplOld = "bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],"
+            if (-not $tplText.Contains($tplOld)) { throw "Unexpected $tplPath layout - check PROFILE_TEMPLATES.web" }
+            $tplText = $tplText.Replace($tplOld, "bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', $names],")
+            [IO.File]::WriteAllText($tplPath, $tplText, $enc)
+            "patched: $tplPath"
+          }
       - uses: pnpm/action-setup@v5.0.0
         with:
           dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
@@ -193,6 +232,20 @@ jobs:
           if ($env:PACKAGE_SIGNING -eq 'unsigned') { $packageArgs += '--unsigned' }
           pnpm @packageArgs
           exit $LASTEXITCODE
+      - name: Verify bundled subagent plugins
+        if: ${{ inputs.include_subagents }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem -LiteralPath 'apps/desktop/.desktop-build' -Recurse -Filter 'desktop-packages.json' -File -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) { throw 'desktop-packages.json not found - prepare:packages did not run' }
+          $set = Get-Content -LiteralPath $files[-1].FullName -Raw | ConvertFrom-Json
+          $have = @($set.packages | ForEach-Object { $_.name })
+          foreach ($name in @('@deepseek-ai/dsh-subagent-codex', '@deepseek-ai/dsh-subagent-claude-code')) {
+            if ($have -notcontains $name) { throw "$name is missing from the Desktop core package set" }
+            $record = $set.packages | Where-Object { $_.name -eq $name }
+            "OK $name $($record.version)"
+          }
       - name: Retain complete package outside the checkout
         id: retained
         env:
