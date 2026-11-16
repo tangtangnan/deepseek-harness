@@ -1,0 +1,368 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 【自用版】Windows x64 桌面安装包（带可配置官方插件）
+#
+# 与官方 .github/workflows/windows-package.yml 的区别（这是「两者区分」的核心）：
+#   · 官方版  runs-on: dsh-win-package-trial   → 必须自建 runner + 机器 preset
+#             + DESKTOP_PUBLISH_RUNNERS 变量 + EV 签名令牌 + 双 job 同机 retention。
+#             fork 仓库没有这套环境，触发后只会一直 "Waiting for a runner"。
+#   · 本自用版 runs-on: windows-2022          → GitHub 托管 runner，开箱即跑；
+#             单 job、无 preset、无 retention、无签名，直接上传 artifact。
+#   · 官方版  name: Package Desktop · Windows · x64
+#   · 本自用版 name: Package Desktop · Windows · x64 · 自用版
+#   · 并发组也独立：官方 windows-desktop-package / 自用 selfuse-windows-desktop-package
+#     （不会互相阻塞，官方那条排队中的 run 不影响本 workflow）
+#
+# 【放置位置】上传到 fork 仓库的：
+#   .github/workflows/package-windows-selfuse.yml
+# 只上传这一个文件即可，不需要上传任何脚本到仓库；构建逻辑全在本文件内。
+# 默认分支是 master；上传后 Actions 列表里才会出现这个 workflow。
+#
+# 【产物】
+#   Artifact: selfuse-windows-x64-unsigned-<run_id>
+#   内容:     deepseek-harness-<version>-win-x64-unsigned.exe（NSIS 安装器，未签名）
+#   可选:     publish_release=true 时额外生成 Draft Release 长期保存
+#
+# 【插件】extra_bundles 是包名清单，逗号/空格/换行分隔，默认两个 subagent。
+#   只支持「本仓库 workspace 里的包」：packages/*/* 或 apps/*。
+#   releaseFamily('dsh') 会把它们打成 tarball（unsigned 走 pack-local-packages.ts，
+#   用的是同一个 family），再补进 prepare-package-set.ts 的 ROOT_PACKAGES 闭包根；
+#   OPTIONAL_BUNDLES 类（本来就在 apps/cli 依赖里）补根也无害。
+#   第三方 npm 插件不在 packedDsh 里，会直接报 "packed inputs omit ..."。
+#   enable_extra_bundles=true 时还会写进 PROFILE_TEMPLATES.web.bundles，装完默认启用；
+#   关掉则只内置不启用，离线机上手动开启会走联网安装，等于用不了。
+#
+# 【为什么不需要 .env.windows 手工配置】
+#   不设 DSH_PACKAGING_PRESET 时，构建脚本读 apps/desktop/.env.windows。
+#   本 workflow 自动写一份「仅供 unsigned 内部构建」的最小配置（占位域名 + 随机
+#   release id），不放进 git、不含任何密钥。unsigned 模式下 forceCodeSigning=false、
+#   publish=null，不需要证书、不需要自动更新源、不需要 DOWNLOAD_* 真实值。
+#
+# 【注意】
+#   · 产物是 unsigned 内部包，禁止对外发布 / 用于自动更新；
+#   · 完整 monorepo 构建 + electron-builder 下载 Electron 可能要 30~90 分钟；
+#   · 两个 subagent 会带进平台二进制，安装包比官方默认更大；
+#   · windows-2022 镜像自带 VSWhere + VS Enterprise 2022（beforeBuild 要编译
+#     installer-ui/window-frame.dll），换成 windows-2025 需自行确认工具链。
+# ═══════════════════════════════════════════════════════════════════════════
+name: Package Desktop · Windows · x64 · 自用版
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: '打包源码分支 / tag（本仓库内的 ref，默认 master）'
+        type: string
+        default: master
+        required: true
+      runner:
+        description: 'GitHub 托管 Windows runner（工具链不符可换）'
+        type: choice
+        options: [windows-2022, windows-2025, windows-latest]
+        default: windows-2022
+        required: true
+      extra_bundles:
+        description: '随安装包内置的官方 bundle 包名，逗号/空格/换行分隔；留空＝只打官方默认内容。仅支持本仓库 workspace 包，第三方 npm 插件不适用'
+        type: string
+        default: '@deepseek-ai/dsh-subagent-codex, @deepseek-ai/dsh-subagent-claude-code'
+        required: false
+      enable_extra_bundles:
+        description: '把 extra_bundles 写进 web profile 模板，装完默认启用；关闭则离线环境无法再手动开启，建议保持 true'
+        type: boolean
+        default: true
+        required: false
+      build_version:
+        description: '自定义版本号（留空＝跟随仓库产品版本）；须符合该仓库的 build-version 规则'
+        type: string
+        default: ''
+        required: false
+      compression_level:
+        description: '安装器压缩等级：3 较快，7 更省体积'
+        type: choice
+        options: ['3', '7']
+        default: '3'
+        required: true
+      toolchain_check:
+        description: '构建前先跑 --check 预检（配置 + VS 工具链），几秒钟，失败时日志更清楚'
+        type: boolean
+        default: true
+        required: false
+      retention:
+        description: 'Artifact 保留天数'
+        type: string
+        default: '30'
+        required: false
+      publish_release:
+        description: '额外生成 Draft Release（长期保存 + 分享链接）'
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: write
+
+# 与官方 workflow 的 windows-desktop-package 完全隔离，互不影响。
+concurrency:
+  group: selfuse-windows-desktop-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build unsigned win-x64 installer
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # 关键：绝不要设 DSH_PACKAGING_PRESET，否则脚本会改读「机器 preset 目录」，
+      # 那是官方自建 runner 才有的东西，托管 runner 上必然找不到。
+      DSH_TELEMETRY_DISABLED: '1'
+      DSH_DESKTOP_UNSIGNED_LOCAL_BUILD: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup pnpm (from packageManager field)
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Diagnostics
+        run: |
+          "runner      : $env:RUNNER_OS $env:RUNNER_ARCH ($env:RUNNER_NAME)"
+          "node        : $(node --version)"
+          "pnpm        : $(pnpm --version)"
+          "product     : $((Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version)"
+          "commit      : $(git rev-parse --short HEAD)"
+          "preset      : '$env:DSH_PACKAGING_PRESET' (must be empty)"
+          "VSWhere     : $(Test-Path 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe')"
+          Get-PSDrive -Name C,D -ErrorAction SilentlyContinue |
+            ForEach-Object { "disk $($_.Name) free: $([math]::Round($_.Free/1GB,1)) GB" }
+
+      - name: Install locked dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 补丁只改两个 TS 数组字面量，不动任何 package.json / lockfile，
+      # 所以 --frozen-lockfile 与 pack-local-packages 的版本校验都不受影响。
+      # 清单通过 env 传入，不拼进表达式，避免 workflow 输入注入 PowerShell。
+      - name: Bundle extra official plugins
+        if: ${{ inputs.extra_bundles != '' }}
+        env:
+          DSH_EXTRA_BUNDLES: ${{ inputs.extra_bundles }}
+          DSH_ENABLE_BUNDLES: ${{ inputs.enable_extra_bundles }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $enc = [Text.UTF8Encoding]::new($false)
+          $list = @($env:DSH_EXTRA_BUNDLES -split '[\s,;]+' | Where-Object { $_ -ne '' } | Select-Object -Unique)
+          if ($list.Count -eq 0) { throw 'extra_bundles resolved to an empty list' }
+          foreach ($name in $list) {
+            if ($name -cnotmatch '^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$') {
+              throw "Invalid npm package name in extra_bundles: $name"
+            }
+          }
+          "requested bundles: $($list -join ', ')"
+
+          # [IO.File] uses the .NET process CWD, not necessarily PowerShell Set-Location.
+          $root = $env:GITHUB_WORKSPACE
+          if (-not $root) { $root = (Get-Location).Path }
+
+          # 1) Desktop runtime dependency closure roots
+          $setPath = Join-Path $root 'apps/desktop/scripts/prepare-package-set.ts'
+          $setText = [IO.File]::ReadAllText($setPath, $enc)
+          $m = [regex]::Match($setText, '(const ROOT_PACKAGES\s*=\s*\[)([^\]]*)(\]\s*as const)')
+          if (-not $m.Success) { throw "Unexpected $setPath layout - check ROOT_PACKAGES" }
+          $inner = $m.Groups[2].Value
+          $add = @($list | Where-Object { $inner -notmatch [regex]::Escape("'" + $_ + "'") })
+          if ($add.Count -gt 0) {
+            $newInner = $inner.TrimEnd().TrimEnd(',') + ', ' + (($add | ForEach-Object { "'" + $_ + "'" }) -join ', ')
+            $setText = $setText.Substring(0, $m.Groups[2].Index) + $newInner + $setText.Substring($m.Groups[2].Index + $m.Groups[2].Length)
+            [IO.File]::WriteAllText($setPath, $setText, $enc)
+            "patched: $setPath (+$($add.Count) root(s))"
+          } else { "already in ROOT_PACKAGES: $setPath" }
+
+          # 2) web profile template (auto-enable after install)
+          if ($env:DSH_ENABLE_BUNDLES -eq 'true') {
+            $tplPath = Join-Path $root 'packages/util/official-bundles/src/bundles.ts'
+            $tplText = [IO.File]::ReadAllText($tplPath, $enc)
+            $t = [regex]::Match($tplText, '(web:\s*\{\s*\r?\n\s*bundles:\s*\[)([^\]]*)(\],)')
+            if (-not $t.Success) { throw "Unexpected $tplPath layout - check PROFILE_TEMPLATES.web" }
+            $tInner = $t.Groups[2].Value
+            $tAdd = @($list | Where-Object { $tInner -notmatch [regex]::Escape("'" + $_ + "'") })
+            if ($tAdd.Count -gt 0) {
+              $newInner = $tInner.TrimEnd().TrimEnd(',') + ', ' + (($tAdd | ForEach-Object { "'" + $_ + "'" }) -join ', ')
+              $tplText = $tplText.Substring(0, $t.Groups[2].Index) + $newInner + $tplText.Substring($t.Groups[2].Index + $t.Groups[2].Length)
+              [IO.File]::WriteAllText($tplPath, $tplText, $enc)
+              "patched: $tplPath (+$($tAdd.Count) bundle(s))"
+            } else { "already enabled in web template: $tplPath" }
+          } else {
+            'enable_extra_bundles=false: shipped but NOT auto-enabled (offline installs cannot enable them later)'
+          }
+
+      # 生成 unsigned 专用的最小 dotenv。占位 origin 只用于通过策略校验，
+      # unsigned 模式 publish=null，不会真的去访问这些地址。
+      - name: Generate local unsigned .env.windows
+        env:
+          SELFUSE_COMPRESSION: ${{ inputs.compression_level }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          if (-not $root) { $root = (Get-Location).Path }
+          $path = Join-Path $root 'apps/desktop/.env.windows'
+          # Checkout is always clean here (.env.windows is gitignored), so regenerate unconditionally.
+          $releaseId = [guid]::NewGuid().ToString('N')
+          $lines = @(
+            '# Generated by package-windows-selfuse.yml for UNSIGNED local builds only.',
+            '# Placeholder origins satisfy the mandatory-update policy validation;',
+            '# unsigned builds have publish=null and never contact these hosts.',
+            'DSH_DESKTOP_APP_ID=com.deepseek.dsh',
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=test',
+            'DOWNLOAD_TEST_ORIGIN=https://example.com',
+            "DOWNLOAD_TEST_RELEASE_ID=$releaseId",
+            'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://example.com',
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://example.com',
+            'DSH_DESKTOP_MANDATORY_UPDATE_CONFIG=''{"allowedAuthOrigins":["https://login.example.com"]}''',
+            'DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4',
+            "DSH_DESKTOP_WINDOWS_COMPRESSION_LEVEL=$env:SELFUSE_COMPRESSION"
+          )
+          [IO.File]::WriteAllText($path, ($lines -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+          "generated: $path (unsigned, no secrets)"
+
+      - name: Preflight configuration and toolchain
+        if: ${{ inputs.toolchain_check }}
+        env:
+          SELFUSE_BUILD_VERSION: ${{ inputs.build_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pnpmArgs = @('run', 'package:desktop:win:x64:unsigned', '--check')
+          if ($env:SELFUSE_BUILD_VERSION) { $pnpmArgs += @('--build-version', $env:SELFUSE_BUILD_VERSION) }
+          "preflight: pnpm $($pnpmArgs -join ' ')"
+          pnpm @pnpmArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Preflight failed. On a hosted runner this is usually the VS C++ toolchain (vswhere) or a missing/invalid apps/desktop/.env.windows.'
+          }
+
+      - name: Build unsigned installer
+        env:
+          SELFUSE_BUILD_VERSION: ${{ inputs.build_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pnpmArgs = @('run', 'package:desktop:win:x64:unsigned')
+          if ($env:SELFUSE_BUILD_VERSION) { $pnpmArgs += @('--build-version', $env:SELFUSE_BUILD_VERSION) }
+          "build: pnpm $($pnpmArgs -join ' ')"
+          pnpm @pnpmArgs
+          if ($LASTEXITCODE -ne 0) { throw "packaging failed; see apps/desktop/.desktop-build/packaging-runs/" }
+
+      - name: Verify bundled official plugins
+        if: ${{ inputs.extra_bundles != '' }}
+        env:
+          DSH_EXTRA_BUNDLES: ${{ inputs.extra_bundles }}
+          DSH_ENABLE_BUNDLES: ${{ inputs.enable_extra_bundles }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          if (-not $root) { $root = (Get-Location).Path }
+          $buildDir = Join-Path $root 'apps/desktop/.desktop-build'
+          $files = @(Get-ChildItem -LiteralPath $buildDir -Recurse -Filter 'desktop-packages.json' -File -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) { throw 'desktop-packages.json not found - prepare:packages did not run' }
+          $set = Get-Content -LiteralPath $files[-1].FullName -Raw | ConvertFrom-Json
+          $list = @($env:DSH_EXTRA_BUNDLES -split '[\s,;]+' | Where-Object { $_ -ne '' } | Select-Object -Unique)
+          foreach ($name in $list) {
+            $record = @($set.packages | Where-Object { $_.name -eq $name })
+            if ($record.Count -eq 0) {
+              throw "$name is missing from the Desktop core package set. Only workspace packages packed by releaseFamily('dsh') can be bundled; third-party npm plugins need source changes."
+            }
+            "OK $name $($record[0].version)"
+          }
+          if ($env:DSH_ENABLE_BUNDLES -eq 'true') {
+            $tpl = Join-Path $root 'packages/util/official-bundles/src/bundles.ts'
+            $text = [IO.File]::ReadAllText($tpl)
+            $t = [regex]::Match($text, '(web:\s*\{\s*\r?\n\s*bundles:\s*\[)([^\]]*)(\],)')
+            if (-not $t.Success) { throw 'PROFILE_TEMPLATES.web not found in bundles.ts' }
+            $webBundles = $t.Groups[2].Value
+            foreach ($name in $list) {
+              if ($webBundles -notmatch [regex]::Escape("'" + $name + "'")) {
+                throw "$name was not written into PROFILE_TEMPLATES.web.bundles"
+              }
+            }
+            'OK web profile template lists every requested bundle'
+          }
+
+      - name: Verify installer artifact
+        id: artifact
+        env:
+          SELFUSE_BUNDLES: ${{ inputs.extra_bundles }}
+          SELFUSE_ENABLE: ${{ inputs.enable_extra_bundles }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          if (-not $root) { $root = (Get-Location).Path }
+          $out = Join-Path $root 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $exes = @(Get-ChildItem -LiteralPath $out -Filter '*.exe' -File -ErrorAction SilentlyContinue)
+          if ($exes.Count -eq 0) { throw "No .exe produced under $out" }
+          foreach ($f in $exes) { "installer: $($f.Name)  $([math]::Round($f.Length/1MB,1)) MB" }
+          # .desktop-build is a hidden directory; upload-artifact filters hidden paths by
+          # default. Stage into a plain release/ folder first (same convention as the
+          # Linux offline kit), so nothing depends on include-hidden-files behavior.
+          $rel = Join-Path $root 'release'
+          New-Item -ItemType Directory -Path $rel -Force | Out-Null
+          Get-ChildItem -LiteralPath $out -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $rel -Force
+          }
+          "staged: $rel"
+          Get-ChildItem -LiteralPath $rel -File | ForEach-Object { "  $($_.Name)" }
+          "dir=$rel" >> $env:GITHUB_OUTPUT
+          "### Self-use Windows installer (UNSIGNED)" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "- Output dir: $out" >> $env:GITHUB_STEP_SUMMARY
+          "- Bundled plugins: $env:SELFUSE_BUNDLES" >> $env:GITHUB_STEP_SUMMARY
+          "- Auto-enabled: $env:SELFUSE_ENABLE" >> $env:GITHUB_STEP_SUMMARY
+          "- INTERNAL USE ONLY: unsigned, never publish or auto-update" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfuse-windows-x64-unsigned-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ fromJSON(inputs.retention) }}
+
+      - name: Retain packaging diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfuse-windows-logs-${{ github.run_id }}
+          path: apps/desktop/.desktop-build/packaging-runs/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Create draft release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: selfuse-win-x64-${{ github.run_number }}
+          name: DeepSeek Harness Windows x64 (self-use, unsigned)
+          body: |
+            自用版 Windows x64 安装器，**unsigned，仅供内部使用**。
+
+            - 源码 ref：`${{ inputs.source_ref }}`
+            - 内置官方插件：`${{ inputs.extra_bundles }}`
+            - 默认启用：`${{ inputs.enable_extra_bundles }}`
+            - 构建方式：GitHub 托管 `${{ inputs.runner }}`，无自建 runner / 无机器 preset / 无签名
+
+            与官方 `windows-package.yml` 产物无任何关系，不要用于发布或自动更新。
+          files: release/*
